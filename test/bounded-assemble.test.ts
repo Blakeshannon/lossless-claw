@@ -19,6 +19,7 @@ import { LcmContextEngine } from "../src/engine.js";
 import { estimateSerializedMessagesTokens } from "../src/estimate-tokens.js";
 import {
   SERIALIZED_OUTPUT_CLAMP_SAFETY_RATIO,
+  buildDegradedLiveAssembleResult,
   clampMessagesToSerializedBudget,
 } from "../src/assemble-fallback.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
@@ -123,7 +124,146 @@ function makeHeavyLiveTranscript(pairs: number, payloadChars: number): AgentMess
   return messages;
 }
 
+/** Build a tool exchange with either runtime result role and ID placement. */
+function makeOversizedToolTurn(
+  resultRole: "tool" | "toolResult",
+  nestedIdOnly: boolean,
+): AgentMessage[] {
+  return [
+    makeUserMessage(0),
+    {
+      role: "assistant",
+      content: [
+        {
+          type: "toolCall",
+          id: "call_image",
+          name: "view_image",
+          arguments: { paths: ["first.png", "second.png", "third.png"] },
+        },
+      ],
+    } as AgentMessage,
+    {
+      role: resultRole,
+      ...(nestedIdOnly ? {} : { toolCallId: "call_image" }),
+      toolName: "view_image",
+      content: [
+        {
+          type: "toolResult",
+          id: "call_image",
+          toolCallId: "call_image",
+          content: "image data ".repeat(2_000),
+        },
+      ],
+    } as AgentMessage,
+  ];
+}
+
 describe("bounded assemble output", () => {
+  const resultShapes = [
+    ["toolResult", false],
+    ["toolResult", true],
+    ["tool", false],
+    ["tool", true],
+  ] as const;
+
+  it.each([false, true])("repairs earlier calls before a preserved assistant reply (preserve: %s)", (preserveSubstantiveAssistantTail) => {
+    const messages = makeOversizedToolTurn("toolResult", false);
+    // An evicted heavy prefix forces clamping while retaining both assistants.
+    messages[0] = { ...makeUserMessage(0), content: "question ".repeat(10_000) } as AgentMessage;
+    messages.pop();
+    messages.push({ role: "assistant", content: "completed reply" } as AgentMessage);
+    const result = clampMessagesToSerializedBudget({
+      messages,
+      tokenBudget: 500,
+      preserveSubstantiveAssistantTail,
+    });
+
+    expect(result.clamped).toBe(true);
+    if (preserveSubstantiveAssistantTail) {
+      expect(result.messages.map((message) => message.role)).toEqual([
+        "user", "assistant", "toolResult", "assistant",
+      ]);
+      expect(result.messages[2]).toMatchObject({ toolCallId: "call_image", isError: true });
+      expect(result.messages[3]).toEqual(messages[2]);
+    } else {
+      expect(result.messages).toEqual([messages[0]]);
+    }
+  });
+
+  it.each([false, true])("preserves the serialized-clamp assistant-tail policy (preserve: %s)", (preserveSubstantiveAssistantTail) => {
+    const messages = makeOversizedToolTurn("toolResult", false).slice(0, 2);
+    const result = clampMessagesToSerializedBudget({
+      messages,
+      tokenBudget: 1,
+      preserveSubstantiveAssistantTail,
+    });
+
+    expect(result.clamped).toBe(true);
+    expect(result.messages).toEqual(
+      preserveSubstantiveAssistantTail ? messages : [messages[0]],
+    );
+  });
+
+  it.each([false, true])("preserves the degraded assistant-tail policy (preserve: %s)", (preserveSubstantiveAssistantTail) => {
+    const liveMessages = makeOversizedToolTurn("toolResult", false).slice(0, 2);
+    const result = buildDegradedLiveAssembleResult({
+      liveMessages,
+      tokenBudget: 1,
+      preserveSubstantiveAssistantTail,
+      contextProjection: { mode: "thread_bootstrap" },
+    });
+
+    expect(result.messages).toEqual(
+      preserveSubstantiveAssistantTail ? liveMessages : [liveMessages[0]],
+    );
+  });
+
+  it.each(resultShapes)("keeps an oversized degraded %s result paired (nested ID only: %s)", (role, nestedIdOnly) => {
+    const liveMessages = makeOversizedToolTurn(role, nestedIdOnly);
+    const originalMessages = structuredClone(liveMessages);
+    const result = buildDegradedLiveAssembleResult({
+      liveMessages,
+      tokenBudget: 100,
+      contextProjection: { mode: "thread_bootstrap", epoch: "test-projection" },
+    });
+
+    expect(result.estimatedTokens).toBeGreaterThan(100);
+    expect(result.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+    ]);
+    expect(result.messages[2]).toEqual({
+      ...liveMessages[2],
+      role: "toolResult",
+      toolCallId: "call_image",
+    });
+    expect(liveMessages).toEqual(originalMessages);
+  });
+
+  it.each(resultShapes)("keeps an oversized clamped %s result paired (nested ID only: %s)", (role, nestedIdOnly) => {
+    const messages = makeOversizedToolTurn(role, nestedIdOnly);
+    const originalMessages = structuredClone(messages);
+    const result = clampMessagesToSerializedBudget({
+      messages,
+      tokenBudget: 100,
+    });
+
+    expect(result.clamped).toBe(true);
+    expect(result.overBudget).toBe(true);
+    expect(result.messages.map((message) => message.role)).toEqual([
+      "user",
+      "assistant",
+      "toolResult",
+    ]);
+    expect(result.messages[2]).toEqual({
+      ...messages[2],
+      role: "toolResult",
+      toolCallId: "call_image",
+    });
+    expect(messages).toEqual(originalMessages);
+  });
+
   it("clamps near-budget serialized output to leave host renderer headroom", () => {
     const messages = makeHeavyLiveTranscript(12, 4_000);
     const serializedTokens = estimateSerializedMessagesTokens(messages);
@@ -243,5 +383,26 @@ describe("bounded assemble output", () => {
     // Ignored sessions are not managed by LCM: no clamping, legacy shape.
     expect(result.messages.length).toBe(liveMessages.length);
     expect(result.estimatedTokens).toBe(0);
+  });
+});
+
+describe("degraded live fallback preserves a user turn", () => {
+  it("re-seats the most recent user turn when budget-trimming drops it from a tool loop", () => {
+    // Regression contributed by @JerretK in #1156: Qwen chat templates require
+    // a user query even when budget pressure retains only a long tool-loop tail.
+    const liveMessages: AgentMessage[] = [makeUserMessage(0)];
+    for (let i = 1; i <= 12; i += 1) {
+      liveMessages.push(makeHeavyToolResultMessage(i, 4_000));
+    }
+
+    const result = buildDegradedLiveAssembleResult({
+      liveMessages,
+      tokenBudget: 3_000,
+      contextProjection: { mode: "thread_bootstrap" },
+    });
+
+    expect(result.messages.length).toBeLessThan(liveMessages.length);
+    expect(result.messages.some((message) => message.role === "user")).toBe(true);
+    expect(result.estimatedTokens).toBeGreaterThan(0);
   });
 });
