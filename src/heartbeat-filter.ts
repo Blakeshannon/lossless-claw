@@ -126,18 +126,18 @@ export function turnLooksLikeHeartbeatTurn(turnMessages: Array<{ content: string
  *
  * A HEARTBEAT_OK turn is: a user message (the heartbeat prompt), followed by
  * any tool call/result messages, ending with an assistant message that is a
- * heartbeat ack. The entire sequence has no durable information value for LCM.
+ * heartbeat ack. Callers must require an explicit pruning opt-in.
  *
- * Detection: assistant content (trimmed, lowercased) starts with "heartbeat_ok"
- * and any text after is not alphanumeric (matches OpenClaw core's ack detection).
- * This catches both exact "HEARTBEAT_OK" and chatty variants like
- * "HEARTBEAT_OK — weekend, no market".
+ * Detection requires exact, case-insensitive "HEARTBEAT_OK" text and a
+ * HEARTBEAT.md marker in the turn. With keepPoll, delete only the acknowledgement;
+ * preserve the poll and intermediate messages. Otherwise delete the whole cycle.
  *
  * Returns the number of messages deleted.
  */
 export async function pruneHeartbeatOkTurns(
-conversationStore: ConversationStore,
-conversationId: number,
+  conversationStore: ConversationStore,
+  conversationId: number,
+  options?: { keepPoll?: boolean },
 ): Promise<number> {
   const allMessages = await conversationStore.getMessages(conversationId);
   if (allMessages.length === 0) {
@@ -172,6 +172,12 @@ conversationId: number,
       continue;
     }
     if (!turnLooksLikeHeartbeatTurn(turnMessages)) {
+      continue;
+    }
+
+    if (options?.keepPoll) {
+      // Preserve the poll prompt (and any other message in the turn); drop only the ack.
+      toDelete.push(msg.messageId);
       continue;
     }
 

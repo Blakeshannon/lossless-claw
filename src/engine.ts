@@ -3191,7 +3191,9 @@ export class LcmContextEngine implements ContextEngine {
             await this.conversationStore.markConversationBootstrapped(conversationId);
 
             if (this.config.pruneHeartbeatOk) {
-              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId);
+              const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversationId, {
+                keepPoll: this.config.preserveHeartbeatPoll,
+              });
               if (pruned > 0) {
                 this.deps.log.info(
                   `[lcm] bootstrap: pruned ${pruned} HEARTBEAT_OK messages from conversation ${conversationId}`,
@@ -3252,6 +3254,11 @@ export class LcmContextEngine implements ContextEngine {
             await this.conversationStore.markConversationBootstrapped(
               freshConversation.conversationId,
             );
+            if (this.config.pruneHeartbeatOk) {
+              await pruneHeartbeatOkTurns(this.conversationStore, freshConversation.conversationId, {
+                keepPoll: this.config.preserveHeartbeatPoll,
+              });
+            }
             this.deps.log.info(
               `[lcm] bootstrap: sqlite projection started fresh conversation=${freshConversation.conversationId} archivedConversation=${conversationId} ${params.sessionLabel} importedMessages=${importedMessages} sourceMessages=${historicalMessages.length}`,
             );
@@ -3283,6 +3290,13 @@ export class LcmContextEngine implements ContextEngine {
 
           if (!conversation.bootstrappedAt) {
             await this.conversationStore.markConversationBootstrapped(conversationId);
+          }
+
+          // Reconcile can restore host transcript acknowledgements that LCM previously pruned.
+          if (this.config.pruneHeartbeatOk) {
+            await pruneHeartbeatOkTurns(this.conversationStore, conversationId, {
+              keepPoll: this.config.preserveHeartbeatPoll,
+            });
           }
 
           if (reconcile.importedMessages > 0) {
@@ -3353,7 +3367,7 @@ export class LcmContextEngine implements ContextEngine {
         this.conversationStore.withTransaction(async () => {
           const entries = await readVisibleSessionTranscriptMessageEntries(params.target!);
           const historicalMessages = entries.map(messageFromVisibleTranscriptEntry);
-          if (params.isHeartbeat) {
+          if (params.isHeartbeat && !this.config.preserveHeartbeatPoll) {
             return {
               importedMessages: 0,
               blockedByImportCap: false,
@@ -3616,7 +3630,7 @@ export class LcmContextEngine implements ContextEngine {
     skipReplayTimestampFloodGuard?: boolean;
   }): Promise<IngestResult> {
     const { sessionId, sessionKey, message, isHeartbeat, createdAt, skipReplayTimestampFloodGuard } = params;
-    if (isHeartbeat) {
+    if (isHeartbeat && !this.config.preserveHeartbeatPoll) {
       return { ingested: false };
     }
     if (!hasPersistableMessageRole(message)) {
@@ -4275,6 +4289,22 @@ export class LcmContextEngine implements ContextEngine {
             }
           }
 
+          // Pruning is an explicit opt-in and shares the turn's atomic receipt boundary.
+          if (
+            this.config.pruneHeartbeatOk &&
+            (params.isHeartbeat || batchLooksLikeHeartbeatAckTurn(params.messages))
+          ) {
+            const committedConversation = await this.conversationStore.getConversationForSession({
+              sessionId,
+              sessionKey,
+            });
+            if (committedConversation) {
+              await pruneHeartbeatOkTurns(this.conversationStore, committedConversation.conversationId, {
+                keepPoll: this.config.preserveHeartbeatPoll,
+              });
+            }
+          }
+
           this.db
             .prepare(
               `INSERT INTO turn_advancements (
@@ -4497,24 +4527,29 @@ export class LcmContextEngine implements ContextEngine {
       }
     }
 
-    if (batchLooksLikeHeartbeatAckTurn(ingestBatch)) {
+    // The visible projection may already contain the turn, leaving ingestBatch empty.
+    if (
+      this.config.pruneHeartbeatOk &&
+      (params.isHeartbeat || batchLooksLikeHeartbeatAckTurn(newMessages))
+    ) {
       try {
         const conversation = await this.conversationStore.getConversationForSession({
           sessionId,
           sessionKey,
         });
         if (conversation) {
-            const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId);
-            if (pruned > 0) {
-              const sessionContext = this.formatSessionLogContext({
-                conversationId: conversation.conversationId,
-                sessionId,
-                sessionKey,
-              });
+          const pruned = await pruneHeartbeatOkTurns(this.conversationStore, conversation.conversationId, {
+            keepPoll: this.config.preserveHeartbeatPoll,
+          });
+          if (pruned > 0) {
+            const sessionContext = this.formatSessionLogContext({
+              conversationId: conversation.conversationId,
+              sessionId,
+              sessionKey,
+            });
             this.deps.log.info(
               `[lcm] afterTurn: pruned ${pruned} heartbeat ack messages for ${sessionContext}`,
             );
-            return;
           }
         }
       } catch (err) {
