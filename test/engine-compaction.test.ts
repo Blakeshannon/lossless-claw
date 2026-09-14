@@ -1641,7 +1641,9 @@ describe("LcmContextEngine.compact token budget plumbing", () => {
       sessionId: "threshold-sweep-partial-over-target",
       sessionFile: "/tmp/session.jsonl",
       tokenBudget: 10_000,
-      currentTokenCount: 12_000,
+      // No observed prompt token count: without it the safe-watermark
+      // clearance cannot apply, so a threshold sweep that misses the ideal
+      // target is still reported as incomplete.
       compactionTarget: "threshold",
     });
 
@@ -1921,5 +1923,144 @@ describe("#639 Mode 2 deferred-compaction wedge (live context exceeds target, no
       "exhausted (no candidates) over-target threshold debt must NOT stay pending forever",
     ).toBe(false);
     expect(m?.retryAttempts ?? 0, "must not accumulate retry attempts on exhaustion").toBe(0);
+  });
+});
+
+describe("safe-watermark threshold sweep verdict (fixed runtime framing)", () => {
+  /** Run a threshold sweep with consistent stored and observed pressure. */
+  const createThresholdSweepFixture = async (params: {
+    tokensAfter: number;
+    observed?: number;
+    stored?: number;
+    authFailure?: boolean;
+    runtimeSettings?: ContextEngineRuntimeSettings;
+  }) => {
+    const engine = createEngine();
+    const storedTokens = params.stored ?? 92_171;
+    const privateEngine = engine as unknown as {
+      compaction: {
+        evaluate: (
+          conversationId: number,
+          tokenBudget: number,
+          observed?: number,
+        ) => Promise<unknown>;
+        compactFullSweep: (input: unknown) => Promise<unknown>;
+        compactUntilUnder: (input: unknown) => Promise<unknown>;
+      };
+    };
+    vi.spyOn(privateEngine.compaction, "evaluate").mockResolvedValue({
+      shouldCompact: true,
+      reason: "threshold",
+      storedTokens,
+      currentTokens: Math.max(storedTokens, params.observed ?? 0),
+      threshold: 64_828,
+      ...(params.observed !== undefined ? {
+        observedTokens: params.observed,
+        projectedTokens: Math.max(storedTokens, params.observed),
+        rawTokensOutsideTail: storedTokens,
+      } : {}),
+    });
+    const compactFullSweepSpy = vi
+      .spyOn(privateEngine.compaction, "compactFullSweep")
+      .mockResolvedValue({
+        actionTaken: true,
+        tokensBefore: storedTokens,
+        tokensAfter: params.tokensAfter,
+        condensed: false,
+        ...(params.authFailure ? { authFailure: true } : {}),
+      });
+    const compactUntilUnderSpy = vi.spyOn(privateEngine.compaction, "compactUntilUnder");
+    const sessionId = `safe-watermark-${params.tokensAfter}-${params.observed ?? "none"}`;
+    await engine.ingest({
+      sessionId,
+      message: makeMessage({ role: "user", content: "trigger" }),
+    });
+    const result = await engine.compact({
+      sessionId,
+      sessionFile: "/tmp/session.jsonl",
+      tokenBudget: 92_612,
+      ...(params.observed !== undefined ? { currentTokenCount: params.observed } : {}),
+      ...(params.runtimeSettings ? { runtimeSettings: params.runtimeSettings } : {}),
+      compactionTarget: "threshold",
+    });
+    return { result, compactFullSweepSpy, compactUntilUnderSpy };
+  };
+
+  it("clears a threshold sweep that misses the ideal target but keeps the projected prompt within budget", async () => {
+    const { result, compactUntilUnderSpy } = await createThresholdSweepFixture({
+      tokensAfter: 77_794,
+      observed: 88_235,
+    });
+
+    expect(result.ok).toBe(true);
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted to safe watermark; ideal target deferred");
+    expect(result.result?.tokensAfter).toBe(77_794);
+    expect(compactUntilUnderSpy).not.toHaveBeenCalled();
+  });
+
+  it("keeps an honest failure when the projected prompt still exceeds the budget after the sweep", async () => {
+    const { result } = await createThresholdSweepFixture({
+      tokensAfter: 95_000,
+      observed: 96_000,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.compacted).toBe(true);
+    expect(result.reason).toBe("compacted but still over target");
+  });
+
+  it("does not apply the safe-watermark clearance when no observed prompt token count is available", async () => {
+    const { result } = await createThresholdSweepFixture({ tokensAfter: 77_794 });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("compacted but still over target");
+  });
+
+  it.each([110_000, 80_000])("retains debt when stored context exceeds budget despite observed count %i", async (observed) => {
+    const { result } = await createThresholdSweepFixture({
+      stored: 150_000,
+      observed,
+      tokensAfter: 130_000,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("compacted but still over target");
+  });
+
+  it.each([
+    { tokensAfter: 82_000, ok: true },
+    { tokensAfter: 84_000, ok: false },
+  ])("includes positive runtime overhead at the budget boundary: $tokensAfter", async ({ tokensAfter, ok }) => {
+    const { result } = await createThresholdSweepFixture({
+      stored: 90_000,
+      observed: 100_000,
+      tokensAfter,
+    });
+
+    expect(result.ok).toBe(ok);
+    expect(result.result?.details).toMatchObject({ projectedTokensAfter: tokensAfter + 10_000 });
+  });
+
+  it("preserves provider auth failure after in-budget partial progress", async () => {
+    const { result } = await createThresholdSweepFixture({
+      tokensAfter: 77_794,
+      observed: 88_235,
+      authFailure: true,
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("provider auth failure after partial compaction");
+  });
+
+  it("does not use host-owned prompt counts to clear stored threshold debt", async () => {
+    const { result } = await createThresholdSweepFixture({
+      tokensAfter: 77_794,
+      observed: 88_235,
+      runtimeSettings: buildRuntimeSettings("openclaw-embedded"),
+    });
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe("compacted but still over target");
   });
 });
