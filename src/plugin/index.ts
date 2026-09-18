@@ -1394,6 +1394,13 @@ function createLcmDependencies(
         };
       } catch (err) {
         log.error(`[lcm] runtime.llm.complete error: ${describeLogError(err)}`);
+        if (describeLogError(err) === "Async work scope is closed") {
+          return {
+            content: [],
+            error: { kind: "runtime_lifecycle", message: describeLogError(err) },
+            ...requestMetadata,
+          };
+        }
         if (runtimeModelOverride && isRuntimeLlmModelPolicyDenial(err)) {
           return {
             content: [],

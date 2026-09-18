@@ -540,6 +540,9 @@ export class LcmContextEngine implements ContextEngine {
   >();
   private deferredCompactionDrains = new Set<string>();
   private pendingSummaryPreparationDrains = new Set<string>();
+  // Data-only requests. The host's background maintain() call owns execution;
+  // never capture a foreground async scope or call-bound LLM capability here.
+  private maintenanceRequests = new Map<string, DeferredCompactionDebtDrainParams>();
   private previousAssembledMessagesByConversation = new Map<number, AssemblePrefixSnapshot>();
   private recentBootstrapImportsByConversation = new Map<number, BootstrapImportObservation>();
   private deps: LcmDependencies;
@@ -1010,32 +1013,18 @@ export class LcmContextEngine implements ContextEngine {
     return Math.max(condensedTargetTokens, Math.floor(leafChunkTokens * 0.1));
   }
 
-  /** Normalize token counters that may legitimately be zero. */
-
-
-
-  /** Try deferred compaction later without letting it jump ahead of foreground work. */
+  /** Record work for the next host-owned background maintenance pass. */
   private scheduleDeferredCompactionDebtDrain(params: DeferredCompactionDebtDrainParams): void {
-    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    setImmediate(() => {
-      void this.drainDeferredCompactionDebtIfIdle({
-        ...params,
-        queueKey,
-      }).catch((err) => {
-        this.deps.log.warn(
-          `[lcm] background deferred compaction failed conversation=${params.conversationId} session=${params.sessionId}: ${describeLogError(err)}`,
-        );
-      });
-    });
+    this.maintenanceRequests.set(this.resolveSessionQueueKey(params.sessionId, params.sessionKey), params);
   }
 
   /** Give an already-ready frontier a fixed queue position at threshold crossing. */
-  private scheduleThresholdPublicationOpportunity(
+  private async scheduleThresholdPublicationOpportunity(
     params: DeferredCompactionDebtDrainParams,
-  ): void {
+  ): Promise<void> {
     const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    void this.withSessionQueue(
+    await this.withSessionQueue(
       queueKey,
       async () => {
         const result = await this.consumeDeferredCompactionDebt({
@@ -1062,39 +1051,26 @@ export class LcmContextEngine implements ContextEngine {
     });
   }
 
-  /** Prepare hidden pending summaries later without recording threshold debt. */
-  private schedulePendingSummaryPreparationDrain(
-    params: PendingSummaryPreparationDrainParams,
-  ): void {
-    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
-    setImmediate(() => {
-      void this.drainPendingSummaryPreparationIfIdle({
-        ...params,
-        queueKey,
-      }).catch((err) => {
-        this.deps.log.warn(
-          `[lcm] background pending summary preparation failed conversation=${params.conversationId} session=${params.sessionId}: ${describeLogError(err)}`,
-        );
-      });
-    });
+  /** Request prepare-only work without starting a detached callback. */
+  private schedulePendingSummaryPreparationDrain(params: PendingSummaryPreparationDrainParams): void {
+    this.maintenanceRequests.set(this.resolveSessionQueueKey(params.sessionId, params.sessionKey), params);
   }
 
   /** Advance below-threshold pending summary preparation only when the session is idle. */
   private async drainPendingSummaryPreparationIfIdle(
-    params: PendingSummaryPreparationDrainParams & { queueKey: string },
-  ): Promise<void> {
+    params: PendingSummaryPreparationDrainParams & { queueKey: string; runtimeContext?: ContextEngineMaintenanceRuntimeContext },
+  ): Promise<ContextEngineMaintenanceResult | undefined> {
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
     const busyQueue = this.sessionOperationQueues.get(params.queueKey);
     if (busyQueue) {
       this.deps.log.debug(
         `[lcm] background pending summary preparation skipped conversation=${params.conversationId} ${sessionLabel} reason=session-queue-busy prepReason=${params.reason}`,
       );
-      void busyQueue.promise.finally(() => {
-        this.schedulePendingSummaryPreparationDrain(params);
-      });
+      // Durable debt/nodes can resume on a later host pass. Do not attach an
+      // unowned continuation to foreground work.
       return;
     }
-    if (this.pendingSummaryPreparationDrains.has(params.queueKey)) {
+    if (this.pendingSummaryPreparationDrains.has(params.queueKey) || this.deferredCompactionDrains.has(params.queueKey)) {
       this.deps.log.debug(
         `[lcm] background pending summary preparation skipped conversation=${params.conversationId} ${sessionLabel} reason=drain-already-running prepReason=${params.reason}`,
       );
@@ -1108,13 +1084,13 @@ export class LcmContextEngine implements ContextEngine {
         await this.compactionTelemetryStore.getConversationCompactionTelemetry(
           params.conversationId,
         );
-      const legacyParams =
+      const legacyParams = params.runtimeContext ?? (
         telemetry?.provider || telemetry?.model
           ? {
               ...(telemetry.provider ? { provider: telemetry.provider } : {}),
               ...(telemetry.model ? { model: telemetry.model } : {}),
             }
-          : undefined;
+          : undefined);
       const result = await this.executePendingCompactionCore({
         conversationId: params.conversationId,
         sessionId: params.sessionId,
@@ -1123,6 +1099,7 @@ export class LcmContextEngine implements ContextEngine {
         currentTokenCount: params.currentTokenCount,
         runtimeSettings: params.runtimeSettings,
         legacyParams,
+        runtimeContext: params.runtimeContext,
         sessionQueueHeld: false,
         publishPolicy: "prepare-only",
       });
@@ -1130,13 +1107,12 @@ export class LcmContextEngine implements ContextEngine {
         `[lcm] background pending summary preparation done conversation=${params.conversationId} ${sessionLabel} changed=${result.compacted} reason=${result.reason ?? "none"} prepReason=${params.reason}`,
       );
       if (
-        result.pending === true &&
-        result.reason !== "pending summaries ready for publish" &&
-        result.reason !== "circuit breaker open" &&
-        result.reason !== PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON
+        result.pending === true && result.reason === "pending summary work remains"
       ) {
-        this.schedulePendingSummaryPreparationDrain(params);
+        const { runtimeContext: _runtimeContext, queueKey: _queueKey, ...request } = params;
+        this.schedulePendingSummaryPreparationDrain(request);
       }
+      return { changed: false, bytesFreed: 0, rewrittenEntries: 0, reason: result.reason };
     } finally {
       this.pendingSummaryPreparationDrains.delete(params.queueKey);
     }
@@ -1150,20 +1126,19 @@ export class LcmContextEngine implements ContextEngine {
    * fallback if the live prompt is already over budget.
    */
   private async drainDeferredCompactionDebtIfIdle(
-    params: DeferredCompactionDebtDrainParams & { queueKey: string },
-  ): Promise<void> {
+    params: DeferredCompactionDebtDrainParams & { queueKey: string; runtimeContext?: ContextEngineMaintenanceRuntimeContext },
+  ): Promise<ContextEngineMaintenanceResult | undefined> {
     const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
     const busyQueue = this.sessionOperationQueues.get(params.queueKey);
     if (busyQueue) {
       this.deps.log.debug(
         `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=session-queue-busy debtReason=${params.reason}`,
       );
-      void busyQueue.promise.finally(() => {
-        this.scheduleDeferredCompactionDebtDrain(params);
-      });
+      // Durable debt/nodes can resume on a later host pass. Do not attach an
+      // unowned continuation to foreground work.
       return;
     }
-    if (this.deferredCompactionDrains.has(params.queueKey)) {
+    if (this.deferredCompactionDrains.has(params.queueKey) || this.pendingSummaryPreparationDrains.has(params.queueKey)) {
       this.deps.log.debug(
         `[lcm] background deferred compaction skipped conversation=${params.conversationId} ${sessionLabel} reason=drain-already-running debtReason=${params.reason}`,
       );
@@ -1188,13 +1163,13 @@ export class LcmContextEngine implements ContextEngine {
         await this.compactionTelemetryStore.getConversationCompactionTelemetry(
           params.conversationId,
         );
-      const legacyParams =
+      const legacyParams = params.runtimeContext ?? (
         telemetry?.provider || telemetry?.model
           ? {
               ...(telemetry.provider ? { provider: telemetry.provider } : {}),
               ...(telemetry.model ? { model: telemetry.model } : {}),
             }
-          : undefined;
+          : undefined);
       const result = await this.consumeDeferredCompactionDebt({
         conversationId: params.conversationId,
         sessionId: params.sessionId,
@@ -1203,6 +1178,7 @@ export class LcmContextEngine implements ContextEngine {
         currentTokenCount: params.currentTokenCount,
         runtimeSettings: params.runtimeSettings,
         legacyParams,
+        runtimeContext: params.runtimeContext,
         sessionQueueHeld: false,
         pendingPublishPolicy: "publish-if-ready",
       });
@@ -1235,11 +1211,13 @@ export class LcmContextEngine implements ContextEngine {
           result?.changed === true && result.reason === "pending summaries published"
             ? await this.summaryStore.getContextTokenCount(params.conversationId)
             : params.currentTokenCount;
+        const { runtimeContext: _runtimeContext, queueKey: _queueKey, ...request } = params;
         this.scheduleDeferredCompactionDebtDrain({
-          ...params,
+          ...request,
           currentTokenCount,
         });
       }
+      return result ?? undefined;
     } finally {
       this.deferredCompactionDrains.delete(params.queueKey);
     }
@@ -3549,78 +3527,50 @@ export class LcmContextEngine implements ContextEngine {
       };
     }
     this.ensureMigrated();
-    const startedAt = Date.now();
-    const sessionLabel = formatSessionLabel(params.sessionId, params.sessionKey);
-    const result = await this.withSessionQueue(
-      this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
-      async () => {
-        const conversation = await this.conversationStore.getConversationForSession({
-          sessionId: params.sessionId,
-          sessionKey: params.sessionKey,
-        });
-        if (!conversation) {
-          return {
-            changed: false,
-            bytesFreed: 0,
-            rewrittenEntries: 0,
-            reason: "conversation not found",
-          };
-        }
+    const queueKey = this.resolveSessionQueueKey(params.sessionId, params.sessionKey);
+    const conversation = await this.conversationStore.getConversationForSession(params);
+    const unchanged = (reason: string): ContextEngineMaintenanceResult => ({
+      changed: false, bytesFreed: 0, rewrittenEntries: 0, reason,
+    });
+    if (!conversation) return unchanged("conversation not found");
+    if (!hostApprovedRuntimeMaintenance) return unchanged("no deferred maintenance work");
 
-        let deferredCompactionResult: ContextEngineMaintenanceResult | null = null;
-        const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
-          conversation.conversationId,
-        );
-        if (hostApprovedRuntimeMaintenance) {
-          const runtimeTokenBudget = (() => {
-            const tokenBudget = asRecord(params.runtimeContext)?.tokenBudget;
-            if (
-              typeof tokenBudget === "number"
-              && Number.isFinite(tokenBudget)
-              && tokenBudget > 0
-            ) {
-              return Math.floor(tokenBudget);
-            }
-            return 128_000;
-          })();
-          const cappedTokenBudget = this.applyAssemblyBudgetCap(runtimeTokenBudget);
-          const maintainCurrentTokenCount =
-            typeof params.runtimeContext?.currentTokenCount === "number"
-              ? Math.floor(params.runtimeContext.currentTokenCount as number)
-              : undefined;
-          if (maintenance?.pending || maintenance?.running) {
-            deferredCompactionResult = await this.consumeDeferredCompactionDebt({
-              conversationId: conversation.conversationId,
-              sessionId: params.sessionId,
-              sessionKey: params.sessionKey,
-              tokenBudget: cappedTokenBudget,
-              currentTokenCount: maintainCurrentTokenCount,
-              runtimeContext: params.runtimeContext,
-              runtimeSettings: params.runtimeSettings,
-              legacyParams: asRecord(params.runtimeContext),
-              sessionQueueHeld: true,
-              pendingPublishPolicy: "publish-if-ready",
-            });
-          }
-        } else if (maintenance?.pending || maintenance?.running) {
-          this.deps.log.debug(
-            `[lcm] maintain: deferred compaction debt pending conversation=${conversation.conversationId} ${sessionLabel} but host runtimeContext.allowDeferredCompactionExecution is disabled`,
-          );
-        }
-
-        return (
-          deferredCompactionResult ?? {
-            changed: false,
-            bytesFreed: 0,
-            rewrittenEntries: 0,
-            reason: "no deferred maintenance work",
-          }
-        );
-      },
-      { operationName: "maintain", context: sessionLabel },
+    const queued = this.maintenanceRequests.get(queueKey);
+    const request = queued?.conversationId === conversation.conversationId ? queued : undefined;
+    const tokenBudget = this.applyAssemblyBudgetCap(this.resolveTokenBudget({
+      runtimeContext: params.runtimeContext,
+    }) ?? request?.tokenBudget ?? 128_000);
+    const currentTokenCount = this.normalizeObservedTokenCount(params.runtimeContext?.currentTokenCount)
+      ?? request?.currentTokenCount;
+    const outcome = unchanged("no deferred maintenance work");
+    // One bounded pass per host invocation. Unfinished nodes/debt remain
+    // durable; another turn can resume them without retaining this call's scope.
+    this.maintenanceRequests.delete(queueKey);
+    const maintenance = await this.compactionMaintenanceStore.getConversationCompactionMaintenance(
+      conversation.conversationId,
     );
-    return result;
+    const work = {
+      conversationId: conversation.conversationId,
+      sessionId: params.sessionId,
+      sessionKey: params.sessionKey,
+      queueKey, tokenBudget, currentTokenCount,
+      runtimeSettings: params.runtimeSettings,
+      runtimeContext: params.runtimeContext,
+      reason: maintenance?.reason ?? "leaf-prep",
+    };
+    let result: ContextEngineMaintenanceResult | undefined;
+    if (maintenance?.pending || maintenance?.running) {
+      result = await this.drainDeferredCompactionDebtIfIdle(work);
+    } else {
+      const leaf = await this.compaction.evaluateLeafTrigger(
+        conversation.conversationId, this.config.leafChunkTokens,
+      );
+      if (!leaf.shouldCompact) return outcome;
+      result = await this.drainPendingSummaryPreparationIfIdle(work);
+    }
+    return result ?? outcome;
   }
+
   private async ingestSingle(params: {
     sessionId: string;
     sessionKey?: string;
@@ -4135,7 +4085,7 @@ export class LcmContextEngine implements ContextEngine {
           currentTokenCount: observedCurrentTokenCount,
           reason: "threshold",
         };
-        this.scheduleThresholdPublicationOpportunity({
+        await this.scheduleThresholdPublicationOpportunity({
           conversationId: conversation.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
