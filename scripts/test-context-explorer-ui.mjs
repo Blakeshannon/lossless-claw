@@ -24,6 +24,7 @@ const browser = await chromium.launch({ headless: true, ...(process.env.LCM_BROW
 try {
   const page = await browser.newPage({ viewport: { width: 440, height: 960 }, deviceScaleFactor: 2 });
   const errors = []; page.on("pageerror", error => errors.push(error.message));
+  await page.clock.install({ time: new Date("2026-09-18T12:00:00Z") });
   await page.goto(`http://127.0.0.1:${server.address().port}`);
   await page.evaluate(async () => {
     const plugin = (await import("/index.js")).default;
@@ -32,14 +33,14 @@ try {
       summaryCount: 3, messageCount: 24, summaryTokens: 12420, messageTokens: 26000, nextOffset: null,
       summaries: [
         { summaryId: "sum_a83d2b", ordinal: 0, kind: "condensed", depth: 2, tokenCount: 6840,
-          preview: "Context architecture & design decisions", earliestAt: "2026-09-14", latestAt: "2026-09-16", createdAt: "2026-09-16", descendantCount: 18, sourceMessageTokenCount: 186000 },
+          preview: "Context architecture & design decisions", earliestAt: "2026-09-14", latestAt: "2026-09-14T12:00:00Z", createdAt: "2026-09-16", descendantCount: 18, sourceMessageTokenCount: 186000 },
         { summaryId: "sum_c91e5f", ordinal: 1, kind: "condensed", depth: 1, tokenCount: 3920,
-          preview: "Search semantics and session boundaries", earliestAt: "2026-09-16", latestAt: "2026-09-17", createdAt: "2026-09-17", descendantCount: 6, sourceMessageTokenCount: 52000 },
+          preview: "Search semantics and session boundaries", earliestAt: "2026-09-16", latestAt: "2026-09-17T12:00:00Z", createdAt: "2026-09-17", descendantCount: 6, sourceMessageTokenCount: 52000 },
         { summaryId: "sum_f24a8c", ordinal: 2, kind: "leaf", depth: 0, tokenCount: 1660,
-          preview: "A read-only explorer beside the conversation", earliestAt: "2026-09-18", latestAt: "2026-09-18", createdAt: "2026-09-18", descendantCount: 0, sourceMessageTokenCount: 12000 },
+          preview: "A read-only explorer beside the conversation", earliestAt: "2026-09-18", latestAt: "2026-09-18T07:00:00Z", createdAt: "2026-09-18", descendantCount: 0, sourceMessageTokenCount: 12000 },
       ],
     };
-    window.calls = []; window.fail = false; window.delay = false;
+    window.snapshot = snapshot; window.calls = []; window.fail = false; window.delay = false;
     const controller = new AbortController();
     const host = { connection: { connected: true }, ui: { registerPanel(panel) { window.panelDefinition = panel; return () => {}; } },
       async request(method, params) {
@@ -62,7 +63,10 @@ try {
   await page.waitForSelector(".lcm-explorer__card");
   assert.equal(await page.locator(".lcm-explorer__card").count(), 3);
   assert.equal(await page.locator(".lcm-explorer__stats strong").first().textContent(), "3");
-  await page.screenshot({ path: resolve(output, "context-explorer.png"), fullPage: true });
+  assert.equal(await page.getByRole("button", { name: "Refresh", exact: true }).count(), 0);
+  assert.deepEqual(await page.locator(".lcm-explorer__age").allTextContents(), ["4d", "1d", "5h"]);
+  assert((await page.locator(".lcm-explorer__card").first().boundingBox()).height < 60);
+  await page.locator(".lcm-explorer").screenshot({ path: resolve(output, "context-explorer.png") });
   await page.locator(".lcm-explorer__card > summary").first().click();
   await page.waitForSelector(".lcm-explorer__content");
   assert.match(await page.locator(".lcm-explorer__content").first().textContent(), /Design discussion/);
@@ -73,24 +77,38 @@ try {
   await page.screenshot({ path: resolve(output, "context-explorer-expanded.png"), fullPage: true });
   const calls = await page.evaluate(() => window.calls);
   assert(calls.every(call => call.method === "plugins.sessionAction" && call.agentId === "main" && call.sessionKey === "agent:main:example"));
+  await page.clock.fastForward(3600000);
+  await page.waitForFunction(() => document.querySelectorAll(".lcm-explorer__age")[2].textContent === "6h");
+  await page.evaluate(() => { window.snapshot.messageCount++; });
+  await page.clock.runFor(10000);
+  await page.waitForFunction(() => document.querySelector(".lcm-explorer__tail").textContent.includes("25 recent"));
+  assert.equal(await page.locator(".lcm-explorer__card[open]").count(), 1);
+  assert.equal(await page.locator(".lcm-explorer__content").count(), 2, "polling preserves expanded details");
   await page.evaluate(() => { window.fail = true; });
-  await page.getByRole("button", { name: "Refresh", exact: true }).click();
-  await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("stale"));
+  await page.clock.runFor(10000);
+  await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("retrying"));
   assert.equal(await page.locator(".lcm-explorer__card").count(), 3);
-  await page.evaluate(() => { window.fail = false; window.delay = true; });
-  await page.getByRole("button", { name: "Refresh", exact: true }).click();
+  await page.evaluate(() => { window.fail = false; });
+  await page.clock.runFor(10000);
+  await page.waitForFunction(() => document.querySelector('[role="status"]').textContent === "Live");
+  await page.evaluate(() => { window.view.update({ ...window.ctx, presented: false }); });
+  const pausedCalls = await page.evaluate(() => window.calls.length);
+  await page.clock.runFor(20000);
+  assert.equal(await page.evaluate(() => window.calls.length), pausedCalls, "hidden panels do not poll");
+  await page.evaluate(() => { window.delay = true; window.view.update(window.ctx); });
   await page.waitForFunction(() => typeof window.release === "function");
   await page.evaluate(() => {
     window.view.update({ ...window.ctx, props: { sessionKey: "agent:other:empty", agentId: "other" } });
     window.delay = false; window.release();
   });
-  await page.waitForFunction(() => !document.querySelector("button").disabled);
-  assert.equal(await page.locator(".lcm-explorer__card").count(), 0, "old session's response must not repaint the new session");
-  await page.getByRole("button", { name: "Refresh", exact: true }).click();
   await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("not recorded"));
+  assert.equal(await page.locator(".lcm-explorer__card").count(), 0, "old session's response must not repaint the new session");
   assert.equal((await page.evaluate(() => window.calls)).at(-1).agentId, "other");
   await page.evaluate(() => window.controller.abort());
   assert.equal(await page.locator(".lcm-explorer").count(), 0);
+  const disposedCalls = await page.evaluate(() => window.calls.length);
+  await page.clock.runFor(20000);
+  assert.equal(await page.evaluate(() => window.calls.length), disposedCalls, "disposal stops polling");
   assert.deepEqual(errors, []);
-  console.log(`PASS: rendering, expansion, child drill-down, text safety, stale errors, session switching, disposal. Screenshots: ${output}`);
+  console.log(`PASS: compact layout, relative ages, automatic refresh/recovery, retained expansion, hidden-panel pause, text safety, session switching, disposal. Screenshots: ${output}`);
 } finally { await browser.close(); await new Promise(done => server.close(done)); }

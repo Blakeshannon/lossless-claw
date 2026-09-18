@@ -9,33 +9,45 @@ type Context = {
 };
 type Host = { ui: { registerPanel(panel: { id: string; label: string; mount: typeof mount }): () => void } };
 const number = (value: number) => value.toLocaleString();
-const tokens = (value: number) => value >= 10000 ? `${(value / 1000).toFixed(1)}k` : number(value);
+const tokens = (value: number) => value >= 1000 ? `${(value / 1000).toFixed(1)}k` : number(value);
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", className = ""): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag); node.textContent = text; node.className = className; return node;
 }
-function date(value: string | null): string {
-  if (!value) return "Unknown date";
+function parsedDate(value: string | null): Date | null {
+  if (!value) return null;
   const parsed = new Date(/(?:Z|[+-]\d\d:\d\d)$/.test(value) ? value : value.replace(" ", "T") + "Z");
-  return Number.isNaN(parsed.getTime()) ? "Unknown date" : parsed.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+function date(value: string | null): string {
+  return parsedDate(value)?.toLocaleString() ?? "Unknown date";
+}
+function age(value: string | null): string {
+  const parsed = parsedDate(value);
+  if (!parsed) return "—";
+  const minutes = Math.max(0, Math.floor((Date.now() - parsed.getTime()) / 60000));
+  if (minutes < 1) return "now";
+  if (minutes < 60) return `${minutes}m`;
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h`;
+  return `${Math.floor(minutes / 1440)}d`;
 }
 
 export function mount(container: HTMLElement, initial: Context) {
   let context = initial, disposed = false, generation = 0, loading = false;
-  let nextOffset: number | null = null, lastSignature = "";
+  let nextOffset: number | null = null, lastSignature = "", queued = false;
   const root = el("section", "", "lcm-explorer");
   const header = el("header", "", "lcm-explorer__header");
   const heading = el("div");
-  heading.append(el("span", "LOSSLESS", "lcm-explorer__eyebrow"), el("h2", "Context explorer"));
-  const refresh = el("button", "Refresh", "lcm-explorer__button"); refresh.type = "button";
-  header.append(heading, refresh);
-  const subtitle = el("p", "This session · active stored context", "lcm-explorer__muted");
+  heading.append(el("h2", "Context explorer"));
+  header.append(heading);
   const stats = el("div", "", "lcm-explorer__stats");
   const status = el("p", "Loading context…", "lcm-explorer__status"); status.setAttribute("role", "status");
   const list = el("div", "", "lcm-explorer__list");
   const more = el("button", "Load more summaries", "lcm-explorer__button"); more.type = "button"; more.hidden = true;
   const tail = el("p", "", "lcm-explorer__tail");
-  const note = el("p", "The summaries Lossless currently retains for assembly. Budgeting, focus, and runtime projection can change what reaches the model; this is not a recording of the last prompt.", "lcm-explorer__note");
-  root.append(header, subtitle, stats, status, list, more, tail, note); container.append(root);
+  const note = el("p", "Stored context · token estimates", "lcm-explorer__note");
+  note.title = "Summaries retained for assembly, not a recording of the last prompt. Budgeting, focus, and runtime projection can change what reaches the model.";
+  header.append(status);
+  root.append(header, stats, list, more, tail, note); container.append(root);
 
   function alive(epoch: number) { return !disposed && !context.signal.aborted && epoch === generation; }
   async function request<T>(payload: Record<string, unknown>): Promise<T> {
@@ -48,17 +60,23 @@ export function mount(container: HTMLElement, initial: Context) {
     return response.result;
   }
 
-  function summaryCard(summary: ExplorerSummary, totalTokens: number): HTMLElement {
+  function summaryCard(summary: ExplorerSummary): HTMLElement {
     const card = el("details", "", "lcm-explorer__card"); card.dataset.summaryId = summary.summaryId;
     const top = el("summary");
     const labels = el("div", "", "lcm-explorer__row");
-    labels.append(el("span", summary.kind === "leaf" ? "Leaf summary" : `Depth ${summary.depth} summary`, "lcm-explorer__kind"),
-      el("span", `${tokens(summary.tokenCount)} tokens`, "lcm-explorer__tokens"));
+    labels.append(el("span", summary.kind === "leaf" ? "Leaf" : `D${summary.depth}`, "lcm-explorer__kind"),
+      el("span", `~${tokens(summary.tokenCount)} tok`, "lcm-explorer__tokens"));
+    const relativeAge = el("time", "", "lcm-explorer__age");
+    relativeAge.dataset.timestamp = summary.latestAt || summary.createdAt;
+    relativeAge.title = summary.latestAt
+      ? `Latest covered content: ${date(summary.latestAt)}. Coverage: ${date(summary.earliestAt)} — ${date(summary.latestAt)}`
+      : `Coverage unknown. Summary created: ${date(summary.createdAt)}`;
+    relativeAge.textContent = age(relativeAge.dataset.timestamp);
+    relativeAge.setAttribute("aria-label", `${relativeAge.textContent} ago. ${relativeAge.title}`);
+    labels.append(relativeAge);
     const title = summary.preview.replace(/^\s*#+\s*/, "").split("\n").find(line => line.trim()) || summary.summaryId;
-    top.append(labels, el("div", title, "lcm-explorer__title"),
-      el("div", `${date(summary.earliestAt)} — ${date(summary.latestAt)}`, "lcm-explorer__muted"));
-    const bar = el("div", "", "lcm-explorer__bar"); const fill = el("span");
-    fill.style.width = `${totalTokens ? Math.max(1, Math.min(100, 100 * summary.tokenCount / totalTokens)) : 0}%`; bar.append(fill); top.append(bar);
+    top.append(el("div", title, "lcm-explorer__title"), labels);
+    card.dataset.signature = JSON.stringify(summary);
     const body = el("div", "", "lcm-explorer__body");
     const metadata = el("div", "", "lcm-explorer__metadata");
     metadata.append(el("code", summary.summaryId), el("span", `Created ${date(summary.createdAt)} · ${number(summary.descendantCount)} descendant summaries`));
@@ -118,39 +136,65 @@ export function mount(container: HTMLElement, initial: Context) {
   }
 
   async function reload(append = false) {
-    if (loading || disposed || context.signal.aborted || !context.presented) return;
+    if (disposed || context.signal.aborted || !context.presented || document.visibilityState === "hidden") return;
+    for (const node of Array.from(list.querySelectorAll<HTMLElement>("[data-timestamp]"))) {
+      node.textContent = age(node.dataset.timestamp ?? null);
+      node.setAttribute("aria-label", `${node.textContent} ago. ${node.title}`);
+    }
+    if (loading) { queued = true; return; }
     if (!context.props.sessionKey) { status.textContent = "Select a session to explore its context."; return; }
     if (!context.host.connection.connected) { status.textContent = "Disconnected · displayed context may be stale."; return; }
-    loading = true; refresh.disabled = true; more.disabled = true;
+    loading = true; more.disabled = true;
     const epoch = generation;
     try {
       const snapshot = await request<ExplorerSnapshot>({ offset: append ? nextOffset ?? 0 : 0 });
       if (!alive(epoch)) return;
+      // Refresh pages already opened by the user, retaining their reading position.
+      const visibleCount = list.children.length;
+      while (!append && snapshot.nextOffset !== null && snapshot.summaries.length < visibleCount) {
+        const page = await request<ExplorerSnapshot>({ offset: snapshot.nextOffset });
+        if (!alive(epoch)) return;
+        if (page.conversationId !== snapshot.conversationId) { queued = true; return; }
+        snapshot.summaries.push(...page.summaries);
+        snapshot.nextOffset = page.nextOffset;
+      }
       const signature = JSON.stringify({ ...snapshot, capturedAt: undefined });
       if (append || signature !== lastSignature) {
-        if (!append) { generation++; list.replaceChildren(); lastSignature = signature; }
-        for (const summary of snapshot.summaries) list.append(summaryCard(summary, snapshot.summaryTokens));
+        if (!append) {
+          // Reuse unchanged rows so live tail updates do not close an open summary.
+          const previous = new Map(Array.from(list.children, node => [(node as HTMLElement).dataset.summaryId, node as HTMLElement]));
+          const rows = snapshot.summaries.map(summary => {
+            const existing = previous.get(summary.summaryId);
+            return existing?.dataset.signature === JSON.stringify(summary) ? existing : summaryCard(summary);
+          });
+          list.replaceChildren(...rows); lastSignature = signature;
+        } else {
+          for (const summary of snapshot.summaries) list.append(summaryCard(summary));
+        }
         nextOffset = snapshot.nextOffset; more.hidden = nextOffset === null;
         stats.replaceChildren();
         for (const [value, label] of [[number(snapshot.summaryCount), "summaries"], [tokens(snapshot.summaryTokens), "summary tokens"]]) {
-          const stat = el("div"); stat.append(el("strong", value), el("span", label)); stats.append(stat);
+          const stat = el("div"); stat.append(el("strong", value), el("span", ` ${label}`)); stats.append(stat);
         }
-        tail.textContent = `${number(snapshot.messageCount)} recent messages · ${tokens(snapshot.messageTokens)} tokens · ${tokens(snapshot.messageTokens + snapshot.summaryTokens)} stored tokens total`;
+        tail.textContent = `${number(snapshot.messageCount)} recent messages · ~${tokens(snapshot.messageTokens)} tok`;
       }
+      status.title = `Automatically checked ${new Date(snapshot.capturedAt).toLocaleTimeString()}`;
       status.textContent = snapshot.conversationId === null ? "Lossless has not recorded context for this session yet." :
         snapshot.summaryCount === 0 ? "No summaries yet. This session is still using recent messages." :
-        `Updated ${new Date(snapshot.capturedAt).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+        "Live";
     } catch {
-      if (alive(epoch)) status.textContent = "Context unavailable · displayed context may be stale. Refresh to retry.";
+      if (alive(epoch)) status.textContent = "Temporarily unavailable · retrying automatically.";
     } finally {
-      loading = false; refresh.disabled = false; more.disabled = false;
+      loading = false; more.disabled = false;
+      if (queued) { queued = false; void reload(); }
     }
   }
-  refresh.onclick = () => { lastSignature = ""; void reload(); };
   more.onclick = () => void reload(true);
-  const timer = setInterval(() => { if (document.visibilityState !== "hidden") void reload(); }, 10000);
+  const resume = () => { void reload(); };
+  const timer = setInterval(resume, 10000);
+  document.addEventListener("visibilitychange", resume);
   void reload();
-  const dispose = () => { disposed = true; generation++; clearInterval(timer); root.remove(); };
+  const dispose = () => { disposed = true; generation++; clearInterval(timer); document.removeEventListener("visibilitychange", resume); initial.signal.removeEventListener("abort", dispose); root.remove(); };
   initial.signal.addEventListener("abort", dispose, { once: true });
   return {
     update(next: Context) {

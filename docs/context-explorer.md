@@ -17,7 +17,11 @@ This build targets and was contract-checked against OpenClaw 2026.9.4.
    reload the browser as OpenClaw requests.
 3. Open a session and select its **Context explorer** panel.
 
-The view refreshes every ten seconds while presented, and has a Refresh button.
+The compact view updates automatically every ten seconds while visible, and
+when reopened or the browser tab becomes visible. There is no Refresh button.
+Short ages (`4d`, `1d`, `5h`) refer to the latest covered content, falling back
+to summary creation time when coverage is unknown. Hover for exact dates.
+Unchanged summary rows retain their expanded text during automatic updates.
 It uses the authenticated session-action transport with `operator.read`, passing
 both the panel's session key and agent identity. It makes no model calls, sends
 no data to external services, and performs no database mutations.
