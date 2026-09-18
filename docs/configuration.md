@@ -2,11 +2,12 @@
 
 Lossless-claw reads plugin configuration from `plugins.entries.lossless-claw.config`.
 
-Lossless-claw requires OpenClaw `2026.7.2-beta.2` or newer so the host can provide
-the branch-safe visible transcript projection used during SQLite session bootstrap
-and enforce context-engine runtime capabilities before an agent run starts. That
-beta is the first published build with the required API; stable `2026.7.1` does
-not provide it.
+Lossless-claw requires OpenClaw `2026.9.2` or newer, the first stable release with
+native plugin session panels. It also provides the branch-safe visible transcript
+projection used during SQLite session bootstrap and context-engine runtime
+capability enforcement. Enable **Settings → Labs → Custom plugin UI** for the
+[Context explorer](context-explorer.md). If you cannot upgrade, keep your earlier
+compatible Lossless release and use `lcm-tui` to inspect context.
 Agent runs need a native host that provides the full context-engine lifecycle:
 session bootstrap, pre-prompt assembly, after-turn ingestion, maintenance,
 compaction, and runtime LLM completion. Native Codex and Pi embedded runs provide
