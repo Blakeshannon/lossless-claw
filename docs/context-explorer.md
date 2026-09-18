@@ -1,9 +1,10 @@
 # Context explorer
 
 The **Context explorer** session panel shows the summaries retained in this
-session's active Lossless context, in assembly order. It includes summary kind
-and depth, covered dates, creation date, stored token estimates, descendant
-counts, expandable summary text, and child-summary drill-down. Recent messages
+session's active Lossless context, in assembly order. It includes readable summary previews, covered dates, stored token estimates,
+expandable Markdown, and recursive source-summary drill-down. “Conversation”
+summaries summarize messages; “Overview” summaries combine earlier summaries.
+Internal summary IDs are not shown, and message counts appear only on leaves. Recent messages
 are counted separately; their text is not loaded by the panel.
 
 ## Open it
@@ -36,6 +37,18 @@ no data to external services, and performs no database mutations.
 If you cannot upgrade OpenClaw, retain your earlier compatible Lossless release
 and use the `lcm-tui` Context View instead. Custom UI being disabled does not
 disable Lossless context management or recall tools.
+
+## Conversation overview
+
+The compact overview shows the sum of stored message tokens in this active
+conversation, plus the size of its active context (summaries + recent messages).
+The compression badge matches `/lcm doctor`: source-message tokens plus
+descendant-summary tokens represented by active summaries, divided by active
+context tokens, rounded to an integer and shown as `1:N` (minimum `1:1`). It is
+omitted when either side is zero. The tooltip explains this accounting; it is
+not raw conversation/context division, a savings percentage, or a billing claim.
+No model calls are made to generate the source-summary titles: these are excerpts
+from the existing summary text.
 
 ## What “active context” means
 

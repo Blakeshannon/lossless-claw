@@ -41,11 +41,26 @@ describe("Context explorer", () => {
   it("drills into a root's sources without allowing cross-session or archived summary access", () => {
     const db = fixture();
     const detail = readContextExplorer(db, "agent:main:a", { summaryId: "root-a" }) as ExplorerDetail;
-    expect(detail.children).toEqual([{ summaryId: "leaf-a", kind: "leaf", depth: 0 }]);
+    expect(detail.children).toMatchObject([{ summaryId: "leaf-a", kind: "leaf", depth: 0, preview: "Original discussion", tokenCount: 12 }]);
     expect(readContextExplorer(db, "agent:main:a", { summaryId: "leaf-a" })).toMatchObject({ sourceMessages: 1 });
     for (const summaryId of ["secret-b", "old-a", "' OR 1=1 --"]) {
       expect(() => readContextExplorer(db, "agent:main:a", { summaryId })).toThrow("not found");
     }
+  });
+  it("counts conversation messages once and matches doctor compression accounting", () => {
+    const db = fixture();
+    db.exec(`UPDATE summaries SET source_message_token_count = 600, descendant_token_count = 60 WHERE summary_id = 'root-a';
+      INSERT INTO messages (conversation_id, seq, role, content, token_count) VALUES
+      (1, 2, 'assistant', 'Older history outside active context', 600),
+      (2, 1, 'user', 'Other conversation', 9000), (3, 1, 'user', 'Archived', 8000)`);
+    const snapshot = readContextExplorer(db, "agent:main:a") as ExplorerSnapshot;
+    expect(snapshot).toMatchObject({ conversationTokens: 610, compressedTokens: 660, compressionRatio: 22 });
+    // Adding an inactive ancestor summary must not double-count the frontier.
+    db.exec("UPDATE summaries SET source_message_token_count = 9999 WHERE summary_id = 'leaf-a'");
+    expect(readContextExplorer(db, "agent:main:a")).toMatchObject({ compressedTokens: 660, compressionRatio: 22 });
+    db.exec("DELETE FROM context_items WHERE conversation_id = 1");
+    expect(readContextExplorer(db, "agent:main:a")).toMatchObject({ conversationTokens: 610, compressionRatio: null });
+    expect(readContextExplorer(db, "unknown")).toMatchObject({ conversationTokens: 0, compressionRatio: null });
   });
   it("does not fall back to archived history or another session", () => {
     const db = fixture();

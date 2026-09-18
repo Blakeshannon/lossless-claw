@@ -11,11 +11,12 @@ export type ExplorerSummary = {
 export type ExplorerSnapshot = {
   basis: "stored-active-context"; capturedAt: string; conversationId: number | null;
   summaryCount: number; messageCount: number; summaryTokens: number; messageTokens: number;
+  conversationTokens: number; compressedTokens: number; compressionRatio: number | null;
   summaries: ExplorerSummary[]; nextOffset: number | null;
 };
 export type ExplorerDetail = {
   summaryId: string; content: string; nextOffset: number | null;
-  sourceMessages: number; children: { summaryId: string; kind: string; depth: number }[];
+  sourceMessages: number; children: ExplorerSummary[];
   childrenTruncated: boolean;
 };
 
@@ -41,7 +42,10 @@ export function readContextExplorer(db: DatabaseSync, sessionKey: string, input:
       length(content) AS length FROM summaries WHERE conversation_id = ? AND summary_id = ?`)
       .get(offset + 1, id, input.summaryId) as { summaryId: string; content: string; length: number } | undefined;
     if (!row) throw new Error("Summary not found in this session");
-    const children = db.prepare(`SELECT s.summary_id AS summaryId, s.kind, s.depth
+    const children = db.prepare(`SELECT s.summary_id AS summaryId, p.ordinal, s.kind, s.depth,
+      s.token_count AS tokenCount, substr(s.content, 1, 220) AS preview,
+      s.earliest_at AS earliestAt, s.latest_at AS latestAt, s.created_at AS createdAt,
+      s.descendant_count AS descendantCount, s.source_message_token_count AS sourceMessageTokenCount
       FROM summary_parents p JOIN summaries s ON s.summary_id = p.parent_summary_id
       WHERE p.summary_id = ? AND s.conversation_id = ? ORDER BY p.ordinal LIMIT 101`)
       .all(row.summaryId, id) as ExplorerDetail["children"];
@@ -54,17 +58,25 @@ export function readContextExplorer(db: DatabaseSync, sessionKey: string, input:
   }
   const empty: ExplorerSnapshot = { basis: "stored-active-context", capturedAt: new Date().toISOString(),
     conversationId: id ?? null, summaryCount: 0, messageCount: 0, summaryTokens: 0,
-    messageTokens: 0, summaries: [], nextOffset: null };
+    messageTokens: 0, conversationTokens: 0, compressedTokens: 0, compressionRatio: null, summaries: [], nextOffset: null };
   if (!id) return empty;
   const totals = db.prepare(`SELECT
     coalesce(sum(c.item_type = 'summary'), 0) AS summaryCount,
     coalesce(sum(c.item_type = 'message'), 0) AS messageCount,
     coalesce(sum(s.token_count), 0) AS summaryTokens,
-    coalesce(sum(m.token_count), 0) AS messageTokens
+    coalesce(sum(m.token_count), 0) AS messageTokens,
+    coalesce(sum(coalesce(s.source_message_token_count, 0) + coalesce(s.descendant_token_count, 0)), 0) AS compressedTokens
     FROM context_items c
     LEFT JOIN summaries s ON s.summary_id = c.summary_id AND s.conversation_id = c.conversation_id
     LEFT JOIN messages m ON m.message_id = c.message_id AND m.conversation_id = c.conversation_id
-    WHERE c.conversation_id = ?`).get(id) as Pick<ExplorerSnapshot, "summaryCount" | "messageCount" | "summaryTokens" | "messageTokens">;
+    WHERE c.conversation_id = ?`).get(id) as Pick<ExplorerSnapshot, "summaryCount" | "messageCount" | "summaryTokens" | "messageTokens" | "compressedTokens">;
+  const conversationTokens = (db.prepare("SELECT coalesce(sum(token_count), 0) AS tokens FROM messages WHERE conversation_id = ?")
+    .get(id) as { tokens: number }).tokens;
+  // Match /lcm doctor: source + descendant-summary tokens over the active frontier,
+  // rounded and floored at 1. This is distinct from raw conversation/context size.
+  const contextTokens = totals.summaryTokens + totals.messageTokens;
+  const compressionRatio = contextTokens > 0 && totals.compressedTokens > 0
+    ? Math.max(1, Math.round(totals.compressedTokens / contextTokens)) : null;
   const rows = db.prepare(`SELECT s.summary_id AS summaryId, c.ordinal, s.kind, s.depth,
     s.token_count AS tokenCount, substr(s.content, 1, 220) AS preview,
     s.earliest_at AS earliestAt, s.latest_at AS latestAt, s.created_at AS createdAt,
@@ -72,7 +84,7 @@ export function readContextExplorer(db: DatabaseSync, sessionKey: string, input:
     FROM context_items c JOIN summaries s ON s.summary_id = c.summary_id AND s.conversation_id = c.conversation_id
     WHERE c.conversation_id = ? AND c.item_type = 'summary' ORDER BY c.ordinal LIMIT 51 OFFSET ?`)
     .all(id, offset) as ExplorerSummary[];
-  return { ...empty, ...totals, summaries: rows.slice(0, 50), nextOffset: rows.length > 50 ? offset + 50 : null };
+  return { ...empty, ...totals, conversationTokens, compressionRatio, summaries: rows.slice(0, 50), nextOffset: rows.length > 50 ? offset + 50 : null };
 }
 
 export function registerContextExplorer(api: OpenClawPluginApi, getDb: () => Promise<DatabaseSync>): void {

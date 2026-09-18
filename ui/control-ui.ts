@@ -11,7 +11,11 @@ type Context = {
 };
 type Host = { ui: { registerPanel(panel: { id: string; label: string; mount: typeof mount }): () => void } };
 const number = (value: number) => value.toLocaleString();
-const tokens = (value: number) => value >= 1000 ? `${(value / 1000).toFixed(1)}k` : number(value);
+const tokens = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}m` : value >= 1000 ? `${(value / 1000).toFixed(1)}k` : number(value);
+function summaryTitle(preview: string | undefined): string {
+  return (preview ?? "").split("\n").find(line => line.trim())?.replace(/^\s*#{1,6}\s*/, "")
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/[*_`]/g, "").trim() || "Earlier discussion";
+}
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", className = ""): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag); node.textContent = text; node.className = className; return node;
 }
@@ -40,15 +44,16 @@ export function mount(container: HTMLElement, initial: Context) {
   const root = el("section", "", "lcm-explorer");
   const header = el("header", "", "lcm-explorer__header");
   const heading = el("div");
-  heading.append(el("h2", "Context explorer"));
+  heading.append(el("h2", "Conversation memory"));
   header.append(heading);
+  const overview = el("div", "", "lcm-explorer__overview");
   const stats = el("div", "", "lcm-explorer__stats");
   const status = el("p", "Loading context…", "lcm-explorer__status"); status.setAttribute("role", "status");
   const list = el("div", "", "lcm-explorer__list");
   const more = el("button", "Load more summaries", "lcm-explorer__button"); more.type = "button"; more.hidden = true;
   const tail = el("p", "", "lcm-explorer__tail");
   header.append(status);
-  root.append(header, stats, list, more, tail); container.append(root);
+  root.append(header, overview, stats, list, more, tail); container.append(root);
 
   function alive(epoch: number) { return !disposed && !context.signal.aborted && epoch === generation; }
   async function request<T>(payload: Record<string, unknown>): Promise<T> {
@@ -61,33 +66,40 @@ export function mount(container: HTMLElement, initial: Context) {
     return response.result;
   }
 
-  function summaryCard(summary: ExplorerSummary): HTMLElement {
-    const card = el("details", "", "lcm-explorer__card"); card.dataset.summaryId = summary.summaryId;
+  function summaryCard(summary: ExplorerSummary, ancestry = new Set([summary.summaryId]), nested = false): HTMLElement {
+    const card = el("details", "", nested ? "lcm-explorer__card lcm-explorer__branch" : "lcm-explorer__card"); card.dataset.summaryId = summary.summaryId;
     const top = el("summary");
     const labels = el("div", "", "lcm-explorer__row");
-    labels.append(el("span", summary.kind === "leaf" ? "Leaf" : `D${summary.depth}`, "lcm-explorer__kind"),
-      el("span", `~${tokens(summary.tokenCount)} tok`, "lcm-explorer__tokens"));
+    labels.append(el("span", summary.kind === "leaf" ? "Conversation" : "Overview", "lcm-explorer__kind"),
+      el("span", summary.tokenCount == null ? "" : `${tokens(summary.tokenCount)} tokens`, "lcm-explorer__tokens"));
     const relativeAge = el("time", "", "lcm-explorer__age");
-    relativeAge.dataset.timestamp = summary.latestAt || summary.createdAt;
+    relativeAge.dataset.timestamp = summary.latestAt || summary.createdAt || "";
     relativeAge.title = summary.latestAt
       ? `Latest covered content: ${date(summary.latestAt)}. Coverage: ${date(summary.earliestAt)} — ${date(summary.latestAt)}`
       : `Coverage unknown. Summary created: ${date(summary.createdAt)}`;
     relativeAge.textContent = age(relativeAge.dataset.timestamp);
     relativeAge.setAttribute("aria-label", `${relativeAge.textContent} ago. ${relativeAge.title}`);
     labels.append(relativeAge);
-    const title = summary.preview.replace(/^\s*#+\s*/, "").split("\n").find(line => line.trim()) || summary.summaryId;
+    const title = summaryTitle(summary.preview);
+    top.title = title;
     top.append(el("div", title, "lcm-explorer__title"), labels);
     card.dataset.signature = JSON.stringify(summary);
     const body = el("div", "", "lcm-explorer__body");
     const metadata = el("div", "", "lcm-explorer__metadata");
-    metadata.append(el("code", summary.summaryId), el("span", `Created ${date(summary.createdAt)} · ${number(summary.descendantCount)} descendant summaries`));
-    if (summary.sourceMessageTokenCount) metadata.append(el("span", `${tokens(summary.sourceMessageTokenCount)} source-message tokens`));
+    if (summary.earliestAt && summary.latestAt) {
+      const format = (value: string) => parsedDate(value)?.toLocaleDateString(undefined, { month: "short", day: "numeric" }) ?? "";
+      const start = format(summary.earliestAt), end = format(summary.latestAt);
+      const coverage = el("span", start === end ? `From ${start}` : `${start} – ${end}`);
+      coverage.title = `Coverage: ${date(summary.earliestAt)} — ${date(summary.latestAt)}`;
+      metadata.append(coverage);
+    }
+    if (summary.sourceMessageTokenCount > 0) metadata.append(el("span", `Distilled from ${tokens(summary.sourceMessageTokenCount)} tokens`));
     body.append(metadata); card.append(top, body);
     let loaded = false, pending = false;
     card.addEventListener("toggle", () => {
       if (!card.open || loaded || pending) return;
       pending = true;
-      void loadDetail(summary.summaryId, body, new Set([summary.summaryId])).then(ok => { loaded = ok; pending = false; });
+      void loadDetail(summary, body, ancestry).then(ok => { loaded = ok; pending = false; });
     });
     return card;
   }
@@ -108,7 +120,8 @@ export function mount(container: HTMLElement, initial: Context) {
     }
   }
 
-  async function loadDetail(summaryId: string, target: HTMLElement, ancestry: Set<string>): Promise<boolean> {
+  async function loadDetail(summary: ExplorerSummary, target: HTMLElement, ancestry: Set<string>): Promise<boolean> {
+    const summaryId = summary.summaryId;
     const epoch = generation;
     target.querySelector(".lcm-explorer__detail-error")?.remove();
     const message = el("p", "Loading summary…", "lcm-explorer__muted"); target.append(message);
@@ -116,7 +129,7 @@ export function mount(container: HTMLElement, initial: Context) {
       const detail = await request<ExplorerDetail>({ summaryId });
       if (!alive(epoch) || !target.isConnected) return false;
       message.remove();
-      target.append(el("p", `${number(detail.sourceMessages)} directly linked source messages`, "lcm-explorer__muted"));
+      if (summary.kind === "leaf") target.append(el("p", `From ${number(detail.sourceMessages)} message${detail.sourceMessages === 1 ? "" : "s"}`, "lcm-explorer__muted lcm-explorer__sources"));
       const preview = el("div", "", "lcm-explorer__preview");
       const text = el("div", "", "lcm-explorer__content"); preview.append(text); target.append(preview);
       let source = detail.content, offset = detail.nextOffset, expanded = false;
@@ -162,19 +175,10 @@ export function mount(container: HTMLElement, initial: Context) {
       };
       if (detail.children.length) {
         const children = el("div", "", "lcm-explorer__children");
-        children.append(el("p", "Source summaries", "lcm-explorer__muted")); target.append(children);
+        children.append(el("p", `Built from ${number(detail.children.length)} earlier ${detail.children.length === 1 ? "summary" : "summaries"}`, "lcm-explorer__muted lcm-explorer__children-label")); target.append(children);
         for (const child of detail.children) {
           if (ancestry.has(child.summaryId)) continue; // Guard corrupt cycles, not legitimate DAG depth.
-          const branch = el("details", "", "lcm-explorer__branch");
-          branch.append(el("summary", `${child.kind === "leaf" ? "Leaf" : `Depth ${child.depth}`} · ${child.summaryId}`));
-          const content = el("div", "", "lcm-explorer__branch-body"); branch.append(content); children.append(branch);
-          let opened = false, pending = false;
-          branch.addEventListener("toggle", () => {
-            if (opened || pending || !branch.open) return;
-            pending = true; content.replaceChildren();
-            void loadDetail(child.summaryId, content, new Set([...ancestry, child.summaryId]))
-              .then(ok => { opened = ok; pending = false; });
-          });
+          children.append(summaryCard(child, new Set([...ancestry, child.summaryId]), true));
         }
       }
       if (detail.childrenTruncated) target.append(el("p", "Showing the first 100 source summaries. More are available in lcm-tui.", "lcm-explorer__muted"));
@@ -225,11 +229,26 @@ export function mount(container: HTMLElement, initial: Context) {
           for (const summary of snapshot.summaries) list.append(summaryCard(summary));
         }
         nextOffset = snapshot.nextOffset; more.hidden = nextOffset === null;
+        overview.replaceChildren();
+        if (typeof snapshot.conversationTokens === "number" && snapshot.conversationId !== null) {
+          const total = el("div", "", "lcm-explorer__total");
+          total.append(el("strong", tokens(snapshot.conversationTokens)), el("span", "tokens in this conversation"));
+          total.title = `${number(snapshot.conversationTokens)} stored message tokens across this conversation`;
+          const compact = el("div", "", "lcm-explorer__compact");
+          compact.append(el("span", `${tokens(snapshot.summaryTokens + snapshot.messageTokens)} in context`));
+          compact.title = "Stored active summaries + recent messages; not the exact model prompt.";
+          if (typeof snapshot.compressionRatio === "number") {
+            const ratio = el("span", `1:${number(snapshot.compressionRatio)} compression`, "lcm-explorer__compression");
+            ratio.title = "Same ratio as /lcm doctor: source-message + descendant-summary tokens represented by active summaries, divided by all active context tokens, rounded (minimum 1:1). Not a token-savings or billing estimate.";
+            compact.append(ratio);
+          }
+          overview.append(total, compact);
+        }
         stats.replaceChildren();
-        for (const [value, label] of [[number(snapshot.summaryCount), "summaries"], [tokens(snapshot.summaryTokens), "summary tokens"]]) {
+        for (const [value, label] of [[number(snapshot.summaryCount), "summaries"], [number(snapshot.messageCount), "recent messages"]]) {
           const stat = el("div"); stat.append(el("strong", value), el("span", ` ${label}`)); stats.append(stat);
         }
-        tail.textContent = `${number(snapshot.messageCount)} recent messages · ~${tokens(snapshot.messageTokens)} tok`;
+        tail.textContent = "Original messages stay in your history.";
       }
       status.title = `Automatically checked ${new Date(snapshot.capturedAt).toLocaleTimeString()}`;
       status.textContent = snapshot.conversationId === null ? "Lossless has not recorded context for this session yet." :
@@ -253,7 +272,7 @@ export function mount(container: HTMLElement, initial: Context) {
     update(next: Context) {
       const changed = next.props.sessionKey !== context.props.sessionKey || next.props.agentId !== context.props.agentId;
       context = next;
-      if (changed) { for (const observer of previewObservers.keys()) observer.disconnect(); previewObservers.clear(); generation++; lastSignature = ""; nextOffset = null; list.replaceChildren(); stats.replaceChildren(); tail.textContent = ""; more.hidden = true; status.textContent = "Loading context…"; }
+      if (changed) { for (const observer of previewObservers.keys()) observer.disconnect(); previewObservers.clear(); generation++; lastSignature = ""; nextOffset = null; list.replaceChildren(); overview.replaceChildren(); stats.replaceChildren(); tail.textContent = ""; more.hidden = true; status.textContent = "Loading context…"; }
       void reload();
     },
     dispose,

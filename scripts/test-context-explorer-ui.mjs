@@ -30,6 +30,7 @@ try {
     const plugin = (await import("/index.js")).default;
     const snapshot = {
       basis: "stored-active-context", capturedAt: new Date().toISOString(), conversationId: 1,
+      conversationTokens: 276000, compressedTokens: 250000, compressionRatio: 7,
       summaryCount: 3, messageCount: 24, summaryTokens: 12420, messageTokens: 26000, nextOffset: null,
       summaries: [
         { summaryId: "sum_a83d2b", ordinal: 0, kind: "condensed", depth: 2, tokenCount: 6840,
@@ -52,8 +53,8 @@ try {
         if (params.payload.summaryId) return { ok: true, result: { summaryId: params.payload.summaryId,
           content: params.payload.offset ? "\n\n## Final page\nLast paragraph." : window.summaryText,
           nextOffset: params.payload.offset ? null : 24000, sourceMessages: 12,
-          children: params.payload.summaryId === "sum_a83d2b" ? [{ summaryId: "sum_child", kind: "condensed", depth: 1 }] :
-            params.payload.summaryId === "sum_child" ? [{ summaryId: "sum_grandchild", kind: "leaf", depth: 0 }] : [], childrenTruncated: false } };
+          children: params.payload.summaryId === "sum_a83d2b" ? [{ summaryId: "sum_child", kind: "condensed", depth: 1, preview: "Choosing a read-only, session-scoped design", tokenCount: 920, createdAt: "2026-09-17", descendantCount: 1, sourceMessageTokenCount: 10000 }] :
+            params.payload.summaryId === "sum_child" ? [{ summaryId: "sum_grandchild", kind: "leaf", depth: 0, preview: "Sidebar layout and safe Markdown rendering", tokenCount: 420, createdAt: "2026-09-17", descendantCount: 0, sourceMessageTokenCount: 5000 }] : [], childrenTruncated: false } };
         return { ok: true, result: snapshot };
       },
     };
@@ -63,11 +64,11 @@ try {
     window.controller = controller;
   });
   await page.waitForSelector(".lcm-explorer__card");
-  assert.equal(await page.locator(".lcm-explorer__card").count(), 3);
+  assert.equal(await page.locator(".lcm-explorer__list > .lcm-explorer__card").count(), 3);
   assert.equal(await page.locator(".lcm-explorer__stats strong").first().textContent(), "3");
   assert.equal(await page.getByRole("button", { name: "Refresh", exact: true }).count(), 0);
   assert.deepEqual(await page.locator(".lcm-explorer__age").allTextContents(), ["4d", "1d", "5h"]);
-  assert((await page.locator(".lcm-explorer__card").first().boundingBox()).height < 60);
+  assert((await page.locator(".lcm-explorer__list > .lcm-explorer__card").first().boundingBox()).height < 60);
   await page.locator(".lcm-explorer").screenshot({ path: resolve(output, "context-explorer.png") });
   await page.locator(".lcm-explorer__card > summary").first().click();
   await page.waitForSelector(".lcm-explorer__content");
@@ -105,19 +106,27 @@ try {
   await page.evaluate(() => document.documentElement.style.setProperty("--accent", "rgb(102, 51, 153)"));
   assert.equal(await page.locator(".lcm-explorer__kind").first().evaluate(node => getComputedStyle(node).color), "rgb(102, 51, 153)");
   await page.screenshot({ path: resolve(output, "context-explorer-recursive.png"), fullPage: true });
+  assert.equal(await page.locator(".lcm-explorer__total strong").textContent(), "276.0k");
+  assert.equal(await page.locator(".lcm-explorer__compression").textContent(), "1:7 compression");
+  assert.equal(await page.locator(".lcm-explorer__sources").count(), 1, "only leaves show message counts");
+  assert.equal(await page.locator(".lcm-explorer__sources").textContent(), "From 12 messages");
+  assert(!(await root.textContent()).includes("sum_"), "no summary IDs in visible copy");
+  assert((await page.locator(".lcm-explorer__branch > summary").first().textContent()).includes("Choosing a read-only"));
+  await root.evaluate(node => { node.scrollTop = 0; });
+  await page.screenshot({ path: resolve(output, "context-explorer-polished.png"), fullPage: true });
   const calls = await page.evaluate(() => window.calls);
   assert(calls.every(call => call.method === "plugins.sessionAction" && call.agentId === "main" && call.sessionKey === "agent:main:example"));
   await page.clock.fastForward(3600000);
-  await page.waitForFunction(() => document.querySelectorAll(".lcm-explorer__age")[2].textContent === "6h");
+  await page.waitForFunction(() => document.querySelectorAll(".lcm-explorer__list > .lcm-explorer__card > summary .lcm-explorer__age")[2].textContent === "6h");
   await page.evaluate(() => { window.snapshot.messageCount++; });
   await page.clock.runFor(10000);
-  await page.waitForFunction(() => document.querySelector(".lcm-explorer__tail").textContent.includes("25 recent"));
-  assert.equal(await page.locator(".lcm-explorer__card[open]").count(), 1);
+  await page.waitForFunction(() => document.querySelector(".lcm-explorer__stats").textContent.includes("25 recent"));
+  assert.equal(await page.locator(".lcm-explorer__list > .lcm-explorer__card[open]").count(), 1);
   assert.equal(await page.locator(".lcm-explorer__content").count(), 3, "polling preserves expanded details");
   await page.evaluate(() => { window.fail = true; });
   await page.clock.runFor(10000);
   await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("retrying"));
-  assert.equal(await page.locator(".lcm-explorer__card").count(), 3);
+  assert.equal(await page.locator(".lcm-explorer__list > .lcm-explorer__card").count(), 3);
   await page.evaluate(() => { window.fail = false; });
   await page.clock.runFor(10000);
   await page.waitForFunction(() => document.querySelector('[role="status"]').textContent === "");
@@ -132,7 +141,7 @@ try {
     window.delay = false; window.release();
   });
   await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("not recorded"));
-  assert.equal(await page.locator(".lcm-explorer__card").count(), 0, "old session's response must not repaint the new session");
+  assert.equal(await page.locator(".lcm-explorer__list > .lcm-explorer__card").count(), 0, "old session's response must not repaint the new session");
   assert.equal((await page.evaluate(() => window.calls)).at(-1).agentId, "other");
   await page.evaluate(() => window.controller.abort());
   assert.equal(await page.locator(".lcm-explorer").count(), 0);
