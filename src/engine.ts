@@ -77,7 +77,7 @@ import { buildToolCallInputMap } from "./tool-pairing.js";
 import { PendingSummaryStore } from "./store/pending-summary-store.js";
 import { parseUtcTimestampOrNull } from "./store/parse-utc-timestamp.js";
 import { SummaryStore, type ContextItemRecord } from "./store/summary-store.js";
-import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
+import { createLcmSummarizeFromLegacyParams, FALLBACK_SUMMARY_MARKER, LcmProviderAuthError, LcmRuntimeLifecycleError, LcmRuntimeLlmPolicyError, LcmRuntimeLlmUnavailableError, LcmSummarySpendLimitError, type LcmSummarizeFn } from "./summarize.js";
 import type {
   LcmDependencies,
   SessionTranscriptReadTarget,
@@ -1945,6 +1945,7 @@ export class LcmContextEngine implements ContextEngine {
         );
       }
     }
+    let summaryAttempts = 0;
     const { summarize, summaryModel, breakerKey } = await this.resolveSummarize({
       legacyParams: this.buildSummarizerLegacyParams({
         legacyParams,
@@ -1952,6 +1953,9 @@ export class LcmContextEngine implements ContextEngine {
       }),
       customInstructions: params.customInstructions,
       breakerScope: compactionScope,
+      onSummaryAttempt: () => {
+        summaryAttempts += 1;
+      },
     });
     if (breakerKey && this.compactionGuards.isCircuitBreakerOpen(breakerKey)) {
       return {
@@ -2348,58 +2352,61 @@ export class LcmContextEngine implements ContextEngine {
         : forceCompaction
           ? tokenBudget
           : undefined;
-    let compactResult: Awaited<ReturnType<CompactionEngine["compactUntilUnder"]>>;
-    try {
-      compactResult = await this.compaction.compactUntilUnder({
-        conversationId,
-        tokenBudget,
-        contextThreshold: resolvedContextThreshold.contextThreshold,
-        ...(resolvedContextThreshold.freshTailCount !== undefined
-          ? { freshTailCount: resolvedContextThreshold.freshTailCount }
-          : {}),
-        ...(resolvedContextThreshold.leafChunkTokens !== undefined
-          ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
-          : {}),
-        targetTokens: convergenceTargetTokens,
-        ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
-        summarize,
-        summaryModel,
-      });
-    } catch (err) {
-      if (err instanceof LcmSummarySpendLimitError) {
-        this.deps.log.warn(
-          `[lcm] compact: summary spend guard blocked conversation=${conversationId} ${sessionLabel} scope=${err.scopeKey} backoffUntil=${err.backoffUntil.toISOString()}`,
-        );
-        return {
-          ok: false,
-          compacted: false,
-          reason: "summary spend backoff open",
-        };
-      }
-      throw err;
+    const compactResult = await this.compaction.compactUntilUnder({
+      conversationId,
+      tokenBudget,
+      contextThreshold: resolvedContextThreshold.contextThreshold,
+      ...(resolvedContextThreshold.freshTailCount !== undefined
+        ? { freshTailCount: resolvedContextThreshold.freshTailCount }
+        : {}),
+      ...(resolvedContextThreshold.leafChunkTokens !== undefined
+        ? { leafChunkTokens: resolvedContextThreshold.leafChunkTokens }
+        : {}),
+      targetTokens: convergenceTargetTokens,
+      ...(effectiveCurrentTokens !== undefined ? { currentTokens: effectiveCurrentTokens } : {}),
+      summarize,
+      summaryModel,
+    });
+    // Host lifecycle and capability/policy failures must still fail closed.
+    if (compactResult.error instanceof LcmRuntimeLifecycleError ||
+        compactResult.error instanceof LcmRuntimeLlmPolicyError ||
+        compactResult.error instanceof LcmRuntimeLlmUnavailableError) {
+      throw compactResult.error;
+    }
+    if (compactResult.error) {
+      this.deps.log.warn(
+        `[lcm] compact: recovery stopped conversation=${conversationId} ${sessionLabel}: ${describeLogError(compactResult.error)}`,
+      );
     }
 
     if (compactResult.authFailure && breakerKey) {
       this.compactionGuards.recordCompactionAuthFailure(breakerKey);
-    } else if (compactResult.rounds > 0 && breakerKey) {
+    } else if (compactResult.actionTaken && !compactResult.error && breakerKey) {
       this.compactionGuards.recordCompactionSuccess(breakerKey);
     }
 
-    const didCompact = compactResult.rounds > 0;
+    const didCompact = compactResult.actionTaken;
     if (didCompact) {
       await this.telemetryRecorder.markLeafCompactionTelemetrySuccess({ conversationId });
     }
 
-    const compactUntilReason = compactResult.authFailure
-      ? (didCompact
-          ? "provider auth failure after partial compaction"
-          : "provider auth failure")
-      : compactResult.success
-        ? didCompact
-          ? "compacted"
-          : "already under target"
-        : "could not reach target";
-    if (!compactResult.success && !compactResult.authFailure) {
+    let compactUntilReason = compactResult.success
+      ? (didCompact ? "compacted" : "already under target")
+      : "could not reach target";
+    if (compactResult.authFailure) {
+      compactUntilReason = didCompact
+        ? "provider auth failure after partial compaction"
+        : "provider auth failure";
+    } else if (compactResult.error) {
+      compactUntilReason = compactResult.error instanceof LcmSummarySpendLimitError
+        ? "summary spend backoff open"
+        : (didCompact ? "compaction failed after partial progress" : "compaction failed");
+    } else if (!didCompact && compactResult.rounds > 0) {
+      compactUntilReason = "no compaction progress";
+    }
+    // Poor reduction is a spend signal only when an allowed summarizer call ran.
+    // Guard errors already carry their backoff; never replace it with a new one.
+    if (!compactResult.success && !compactResult.authFailure && !compactResult.error && summaryAttempts > 0) {
       this.compactionGuards.openSummarySpendBackoff({
         scopeKey: summarySpendScopeKey,
         reason: compactUntilReason,
@@ -2413,6 +2420,7 @@ export class LcmContextEngine implements ContextEngine {
       ok: compactResult.success,
       compacted: didCompact,
       reason: compactUntilReason,
+      ...(compactResult.error ? { error: describeLogError(compactResult.error) } : {}),
       result: {
         tokensBefore: decision.currentTokens,
         tokensAfter: compactResult.finalTokens,
@@ -2484,6 +2492,8 @@ export class LcmContextEngine implements ContextEngine {
     customInstructions?: string;
     breakerScope: string;
     allowEmergencyFallback?: boolean;
+    /** Observe provider/custom calls, excluding deterministic fallback and denied calls. */
+    onSummaryAttempt?: () => void;
   }): Promise<{
     summarize: LcmSummarizeFn;
     summaryModel: string;
@@ -2501,6 +2511,7 @@ export class LcmContextEngine implements ContextEngine {
         summarize: this.compactionGuards.guardCustomSummarize({
           summarize: lp.summarize as LcmSummarizeFn,
           scopeKey,
+          onAttempt: params.onSummaryAttempt,
         }),
         summaryModel: "unknown",
         breakerKey: `custom:${breakerScope}`,
@@ -2515,6 +2526,7 @@ export class LcmContextEngine implements ContextEngine {
         deps: this.compactionGuards.buildSummarySpendGuardedDeps({
           scopeKey,
           reason: "compaction summarizer call",
+          onAttempt: params.onSummaryAttempt,
         }),
         legacyParams: lp,
         customInstructions,
