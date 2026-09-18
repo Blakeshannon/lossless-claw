@@ -1,8 +1,8 @@
 /* Inherit live Control UI theme tokens; do not pin a palette or color mode. */
-.lcm-explorer { --lcm-accent: var(--accent, currentColor); color: var(--text, CanvasText); font: 12px/1.45 var(--font-body, system-ui, sans-serif); padding: 12px; min-width: 0; }
+.lcm-explorer { box-sizing: border-box; --lcm-accent: var(--accent, currentColor); color: var(--text, CanvasText); font: 12px/1.45 var(--font-body, system-ui, sans-serif); padding: 12px; min-width: 0; min-height: 0; height: 100%; max-height: 100%; flex: 1 1 0; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .lcm-explorer *, .lcm-explorer *::before, .lcm-explorer *::after { box-sizing: border-box; }
 .lcm-explorer__header { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
-.lcm-explorer h2 { font-size: 13px; font-weight: 600; margin: 0; }
+.lcm-explorer__header h2 { font-size: 13px; font-weight: 600; margin: 0; }
 .lcm-explorer__muted { color: var(--muted, GrayText); font-size: 11px; }
 .lcm-explorer__stats { display: flex; flex-wrap: wrap; gap: 4px 14px; margin: 6px 0 10px; color: var(--muted, GrayText); font-size: 11px; }
 .lcm-explorer__stats strong { color: var(--text, CanvasText); font-weight: 500; font-variant-numeric: tabular-nums; }
@@ -22,7 +22,7 @@
 .lcm-explorer__age { margin-left: auto; }
 .lcm-explorer__body { padding: 4px 12px 10px; }
 .lcm-explorer__metadata { display: grid; gap: 4px; color: var(--muted, GrayText); font-size: 10px; overflow-wrap: anywhere; }
-.lcm-explorer__content { font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; margin: 10px 0; line-height: 1.6; }
+.lcm-explorer__content { font: inherit; overflow-wrap: anywhere; margin: 0; line-height: 1.6; }
 .lcm-explorer__branch { margin-top: 8px; border-left: 1px solid var(--lcm-accent); padding-left: 8px; min-width: 0; overflow-wrap: anywhere; }
 .lcm-explorer__branch > summary { cursor: pointer; color: var(--muted, GrayText); font-size: 11px; }
 .lcm-explorer__button { font: inherit; font-size: 11px; padding: 5px 8px; border: 1px solid var(--border, currentColor); border-radius: 5px; background: transparent; color: var(--text, CanvasText); cursor: pointer; }
@@ -30,3 +30,22 @@
 .lcm-explorer__button:disabled { opacity: .5; cursor: default; }
 .lcm-explorer > .lcm-explorer__button { margin-top: 8px; }
 .lcm-explorer__tail { color: var(--muted, GrayText); font-size: 11px; margin: 9px 0 3px; }
+
+.lcm-explorer__preview { overflow: hidden; margin: 10px 0 6px; }
+.lcm-explorer__content > :first-child { margin-top: 0; }
+.lcm-explorer__content > :last-child { margin-bottom: 0; }
+.lcm-explorer__content p, .lcm-explorer__content ul, .lcm-explorer__content ol { margin: .6em 0; }
+.lcm-explorer__content h1, .lcm-explorer__content h2, .lcm-explorer__content h3,
+.lcm-explorer__content h4, .lcm-explorer__content h5, .lcm-explorer__content h6 { font-size: 1.05em; line-height: 1.5; margin: 1em 0 .4em; color: var(--text-strong, var(--text)); }
+.lcm-explorer__content ul, .lcm-explorer__content ol { padding-left: 1.5em; }
+.lcm-explorer__content pre { overflow: auto; padding: 8px; background: var(--bg-hover, transparent); }
+.lcm-explorer__content code { font-family: var(--mono, monospace); font-size: .95em; }
+.lcm-explorer__content blockquote { border-left: 2px solid var(--border, currentColor); margin: .7em 0; padding-left: 10px; color: var(--muted, GrayText); }
+.lcm-explorer__content a { color: var(--link, var(--accent, currentColor)); }
+.lcm-explorer__content table { display: block; max-width: 100%; overflow: auto; border-collapse: collapse; }
+.lcm-explorer__content th, .lcm-explorer__content td { border: 1px solid var(--border, currentColor); padding: 4px 6px; }
+.lcm-explorer__children { margin-top: 12px; }
+.lcm-explorer__branch { margin-left: 2px; padding-left: 10px; }
+.lcm-explorer__branch > summary { padding: 5px 0; }
+.lcm-explorer__branch-body { min-width: 0; }
+.lcm-explorer__expand { margin-bottom: 4px; }

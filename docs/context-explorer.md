@@ -22,6 +22,11 @@ when reopened or the browser tab becomes visible. There is no Refresh button.
 Short ages (`4d`, `1d`, `5h`) refer to the latest covered content, falling back
 to summary creation time when coverage is unknown. Hover for exact dates.
 Unchanged summary rows retain their expanded text during automatic updates.
+The sidebar scrolls independently. Opening a summary shows metadata and a
+Markdown preview: the first paragraph or about five rendered lines, whichever
+is longer. **Show full summary** loads the remaining text; **Show less** returns
+to the preview. Source summaries expand recursively with indentation and the
+same preview/full-text controls. Descendants load only when opened.
 Colors, accents, focus outlines, and the UI font follow the selected OpenClaw
 theme automatically, including theme changes while the panel is open.
 It uses the authenticated session-action transport with `operator.read`, passing
@@ -65,5 +70,6 @@ and message counts/tokens, up to 50 summaries, and a nullable `nextOffset`.
 Use `{ "summaryId": "sum_...", "offset": 0 }` for summary text (24,000-character
 pages), directly linked source-message count, and up to 100 child summaries.
 Detail reads enforce the same active-conversation boundary. The browser renders
-all stored text as text, never HTML. No database path, credentials, or provider
+Markdown through Marked and a restricted DOMPurify allowlist. Embedded images,
+active HTML, styles, and unsafe links are not rendered. No database path, credentials, or provider
 access is exposed to the browser.

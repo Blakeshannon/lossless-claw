@@ -1,4 +1,6 @@
 import type { ExplorerSnapshot, ExplorerSummary, ExplorerDetail } from "../src/context-explorer.js";
+import { marked } from "marked";
+import DOMPurify from "dompurify";
 import "./context-explorer.css";
 
 // Structural subset of OpenClaw's public ControlUiPlugin v1 contract. Keeping
@@ -34,6 +36,7 @@ function age(value: string | null): string {
 export function mount(container: HTMLElement, initial: Context) {
   let context = initial, disposed = false, generation = 0, loading = false;
   let nextOffset: number | null = null, lastSignature = "", queued = false;
+  const previewObservers = new Map<ResizeObserver, HTMLElement>();
   const root = el("section", "", "lcm-explorer");
   const header = el("header", "", "lcm-explorer__header");
   const heading = el("div");
@@ -84,56 +87,108 @@ export function mount(container: HTMLElement, initial: Context) {
     card.addEventListener("toggle", () => {
       if (!card.open || loaded || pending) return;
       pending = true;
-      void loadDetail(summary.summaryId, body, 0).then(ok => { loaded = ok; pending = false; });
+      void loadDetail(summary.summaryId, body, new Set([summary.summaryId])).then(ok => { loaded = ok; pending = false; });
     });
     return card;
   }
 
-  async function loadDetail(summaryId: string, target: HTMLElement, depth: number): Promise<boolean> {
+  function renderMarkdown(target: HTMLElement, source: string) {
+    // Narrow HTML allowlist: no images, embedded content, styles, or remote loads.
+    target.replaceChildren(DOMPurify.sanitize(marked.parse(source, { async: false }), {
+      RETURN_DOM_FRAGMENT: true,
+      ALLOWED_TAGS: ["p", "br", "hr", "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li",
+        "strong", "em", "del", "blockquote", "pre", "code", "a", "table", "thead", "tbody", "tr", "th", "td"],
+      ALLOWED_ATTR: ["href", "title", "start"],
+      ALLOW_DATA_ATTR: false,
+    }));
+    for (const link of Array.from(target.querySelectorAll("a"))) {
+      const href = link.getAttribute("href") ?? "";
+      if (!/^(https?:|mailto:)/i.test(href)) link.removeAttribute("href");
+      link.setAttribute("target", "_blank"); link.setAttribute("rel", "noopener noreferrer");
+    }
+  }
+
+  async function loadDetail(summaryId: string, target: HTMLElement, ancestry: Set<string>): Promise<boolean> {
     const epoch = generation;
+    target.querySelector(".lcm-explorer__detail-error")?.remove();
     const message = el("p", "Loading summary…", "lcm-explorer__muted"); target.append(message);
     try {
       const detail = await request<ExplorerDetail>({ summaryId });
       if (!alive(epoch) || !target.isConnected) return false;
       message.remove();
-      const text = el("pre", detail.content, "lcm-explorer__content"); target.append(text);
-      let offset = detail.nextOffset;
-      if (offset !== null) {
-        const remainder = el("button", "Read more", "lcm-explorer__button"); remainder.type = "button"; target.append(remainder);
-        remainder.onclick = async () => {
-          remainder.disabled = true;
-          try {
-            const chunk = await request<ExplorerDetail>({ summaryId, offset });
-            if (!alive(epoch)) return;
-            text.textContent += chunk.content; offset = chunk.nextOffset;
-            if (offset === null) remainder.remove();
-          } catch { if (alive(epoch)) remainder.textContent = "Retry reading more"; }
-          finally { remainder.disabled = false; }
-        };
-      }
       target.append(el("p", `${number(detail.sourceMessages)} directly linked source messages`, "lcm-explorer__muted"));
-      if (depth < 8) for (const child of detail.children) {
-        const branch = el("details", "", "lcm-explorer__branch");
-        branch.append(el("summary", `${child.kind === "leaf" ? "Leaf" : `Depth ${child.depth}`} · ${child.summaryId}`));
-        const content = el("div"); branch.append(content); target.append(branch);
-        let opened = false;
-        branch.addEventListener("toggle", () => {
-          if (opened || !branch.open) return;
-          opened = true;
-          void loadDetail(child.summaryId, content, depth + 1).then(ok => { opened = ok; });
-        });
+      const preview = el("div", "", "lcm-explorer__preview");
+      const text = el("div", "", "lcm-explorer__content"); preview.append(text); target.append(preview);
+      let source = detail.content, offset = detail.nextOffset, expanded = false;
+      renderMarkdown(text, source);
+      const toggle = el("button", "Show full summary", "lcm-explorer__button lcm-explorer__expand");
+      toggle.type = "button"; toggle.setAttribute("aria-expanded", "false"); target.append(toggle);
+      const measure = () => {
+        if (!alive(epoch) || !target.isConnected || text.getBoundingClientRect().width === 0) return;
+        const lineHeight = parseFloat(getComputedStyle(text).lineHeight);
+        const paragraph = text.querySelector("p");
+        const paragraphBottom = paragraph ? paragraph.getBoundingClientRect().bottom - text.getBoundingClientRect().top : 0;
+        const previewHeight = Math.ceil(Math.max(lineHeight * 5, paragraphBottom));
+        const truncated = text.scrollHeight > previewHeight + 1 || offset !== null;
+        preview.style.maxHeight = expanded ? "none" : `${previewHeight}px`;
+        toggle.hidden = !expanded && !truncated;
+        for (const link of Array.from(text.querySelectorAll("a"))) {
+          if (expanded) link.removeAttribute("tabindex"); else link.setAttribute("tabindex", "-1");
+        }
+      };
+      const observer = new ResizeObserver(measure); observer.observe(text); previewObservers.set(observer, text);
+      measure();
+      toggle.onclick = async () => {
+        expanded = !expanded;
+        toggle.setAttribute("aria-expanded", String(expanded));
+        toggle.textContent = expanded ? "Show less" : "Show full summary";
+        measure();
+        if (!expanded || offset === null) return;
+        toggle.disabled = true;
+        try {
+          // Fetch remaining bounded pages only when the reader requests full text.
+          while (offset !== null && alive(epoch) && target.isConnected) {
+            const chunk: ExplorerDetail = await request<ExplorerDetail>({ summaryId, offset });
+            if (!alive(epoch) || !target.isConnected) return;
+            if (chunk.nextOffset !== null && chunk.nextOffset <= offset) throw new Error("Invalid continuation");
+            source += chunk.content; offset = chunk.nextOffset;
+          }
+          renderMarkdown(text, source);
+        } catch {
+          expanded = false;
+          toggle.setAttribute("aria-expanded", "false");
+          toggle.textContent = "Retry full summary";
+        } finally { toggle.disabled = false; measure(); }
+      };
+      if (detail.children.length) {
+        const children = el("div", "", "lcm-explorer__children");
+        children.append(el("p", "Source summaries", "lcm-explorer__muted")); target.append(children);
+        for (const child of detail.children) {
+          if (ancestry.has(child.summaryId)) continue; // Guard corrupt cycles, not legitimate DAG depth.
+          const branch = el("details", "", "lcm-explorer__branch");
+          branch.append(el("summary", `${child.kind === "leaf" ? "Leaf" : `Depth ${child.depth}`} · ${child.summaryId}`));
+          const content = el("div", "", "lcm-explorer__branch-body"); branch.append(content); children.append(branch);
+          let opened = false, pending = false;
+          branch.addEventListener("toggle", () => {
+            if (opened || pending || !branch.open) return;
+            pending = true; content.replaceChildren();
+            void loadDetail(child.summaryId, content, new Set([...ancestry, child.summaryId]))
+              .then(ok => { opened = ok; pending = false; });
+          });
+        }
       }
-      if (detail.childrenTruncated || (depth >= 8 && detail.children.length)) {
-        target.append(el("p", "More descendants are available in lcm-tui.", "lcm-explorer__muted"));
-      }
+      if (detail.childrenTruncated) target.append(el("p", "Showing the first 100 source summaries. More are available in lcm-tui.", "lcm-explorer__muted"));
       return true;
     } catch {
-      if (alive(epoch)) message.textContent = "Could not read this summary. Close and reopen to retry.";
+      if (alive(epoch)) { message.classList.add("lcm-explorer__detail-error"); message.textContent = "Could not read this summary. Close and reopen to retry."; }
       return false;
     }
   }
 
   async function reload(append = false) {
+    for (const [observer, node] of previewObservers) {
+      if (!node.isConnected) { observer.disconnect(); previewObservers.delete(observer); }
+    }
     if (disposed || context.signal.aborted || !context.presented || document.visibilityState === "hidden") return;
     for (const node of Array.from(list.querySelectorAll<HTMLElement>("[data-timestamp]"))) {
       node.textContent = age(node.dataset.timestamp ?? null);
@@ -192,13 +247,13 @@ export function mount(container: HTMLElement, initial: Context) {
   const timer = setInterval(resume, 10000);
   document.addEventListener("visibilitychange", resume);
   void reload();
-  const dispose = () => { disposed = true; generation++; clearInterval(timer); document.removeEventListener("visibilitychange", resume); initial.signal.removeEventListener("abort", dispose); root.remove(); };
+  const dispose = () => { disposed = true; generation++; clearInterval(timer); document.removeEventListener("visibilitychange", resume); initial.signal.removeEventListener("abort", dispose); for (const observer of previewObservers.keys()) observer.disconnect(); previewObservers.clear(); root.remove(); };
   initial.signal.addEventListener("abort", dispose, { once: true });
   return {
     update(next: Context) {
       const changed = next.props.sessionKey !== context.props.sessionKey || next.props.agentId !== context.props.agentId;
       context = next;
-      if (changed) { generation++; lastSignature = ""; nextOffset = null; list.replaceChildren(); stats.replaceChildren(); tail.textContent = ""; more.hidden = true; status.textContent = "Loading context…"; }
+      if (changed) { for (const observer of previewObservers.keys()) observer.disconnect(); previewObservers.clear(); generation++; lastSignature = ""; nextOffset = null; list.replaceChildren(); stats.replaceChildren(); tail.textContent = ""; more.hidden = true; status.textContent = "Loading context…"; }
       void reload();
     },
     dispose,

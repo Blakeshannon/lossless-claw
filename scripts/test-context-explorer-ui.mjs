@@ -16,7 +16,7 @@ const server = createServer(async (req, res) => {
   res.setHeader("content-type", "text/html");
   res.end(`<!doctype html><html><head><meta charset="utf-8"><link rel="stylesheet" href="/index.css"><style>
     :root{color-scheme:dark;--text:#dce5e9;--muted:#95a6b0;--card:#1b242b;--border:#303d45}
-    body{margin:0;background:#151d24}main{width:400px;min-height:800px;margin:auto;border-inline:1px solid #303d45}
+    body{margin:0;background:#151d24}main{display:flex;flex-direction:column;width:400px;height:800px;min-height:0;margin:auto;border-inline:1px solid #303d45}
     </style></head><body><main id="panel"></main></body></html>`);
 });
 await new Promise(done => server.listen(0, "127.0.0.1", done));
@@ -40,6 +40,7 @@ try {
           preview: "A read-only explorer beside the conversation", earliestAt: "2026-09-18", latestAt: "2026-09-18T07:00:00Z", createdAt: "2026-09-18", descendantCount: 0, sourceMessageTokenCount: 12000 },
       ],
     };
+    window.summaryText = "## Design discussion\n" + "Keep the explorer **session-scoped** and preserve summary coverage. ".repeat(12) + "\n\n## Search decision\n" + ("- Preserve the summary DAG\n- Support read-only child inspection\n\n").repeat(15) + "<img src=x onerror=window.injected=true>\n\n[Unsafe](javascript:alert(1))";
     window.snapshot = snapshot; window.calls = []; window.fail = false; window.delay = false;
     const controller = new AbortController();
     const host = { connection: { connected: true }, ui: { registerPanel(panel) { window.panelDefinition = panel; return () => {}; } },
@@ -49,9 +50,10 @@ try {
         if (window.delay) await new Promise(done => { window.release = done; });
         if (params.sessionKey === "agent:other:empty") return { ok: true, result: { ...snapshot, conversationId: null, summaryCount: 0, summaries: [] } };
         if (params.payload.summaryId) return { ok: true, result: { summaryId: params.payload.summaryId,
-          content: "## Design discussion\nKeep the explorer session-scoped. Surface summary coverage and token estimates without implying these are the exact provider prompt.\n\n## Search decision\nPreserve the summary DAG and support read-only child inspection.\n\n<img src=x onerror=window.injected=true>",
-          nextOffset: null, sourceMessages: 12,
-          children: params.payload.summaryId === "sum_a83d2b" ? [{ summaryId: "sum_child", kind: "leaf", depth: 0 }] : [], childrenTruncated: false } };
+          content: params.payload.offset ? "\n\n## Final page\nLast paragraph." : window.summaryText,
+          nextOffset: params.payload.offset ? null : 24000, sourceMessages: 12,
+          children: params.payload.summaryId === "sum_a83d2b" ? [{ summaryId: "sum_child", kind: "condensed", depth: 1 }] :
+            params.payload.summaryId === "sum_child" ? [{ summaryId: "sum_grandchild", kind: "leaf", depth: 0 }] : [], childrenTruncated: false } };
         return { ok: true, result: snapshot };
       },
     };
@@ -75,6 +77,34 @@ try {
   await page.locator(".lcm-explorer__branch > summary").click();
   await page.waitForFunction(() => document.querySelectorAll(".lcm-explorer__content").length === 2);
   await page.screenshot({ path: resolve(output, "context-explorer-expanded.png"), fullPage: true });
+  // Every node starts with a rendered, bounded preview; descendants remain reachable.
+  const preview = page.locator(".lcm-explorer__preview").first();
+  await page.waitForFunction(() => document.querySelector(".lcm-explorer__preview").style.maxHeight !== "");
+  const size = await preview.evaluate(node => ({ height: node.clientHeight, full: node.scrollHeight,
+    paragraph: node.querySelector("p").getBoundingClientRect().bottom - node.getBoundingClientRect().top }));
+  assert(size.height < size.full, "long summary is collapsed");
+  assert(size.height >= size.paragraph - 1, "preview preserves the entire first paragraph");
+  assert.equal(await page.locator(".lcm-explorer__content h2").first().textContent(), "Design discussion");
+  assert.equal(await page.locator(".lcm-explorer__content strong").first().textContent(), "session-scoped");
+  assert.equal(await page.locator('a[href^="javascript:"]').count(), 0);
+  await page.locator(".lcm-explorer__branch .lcm-explorer__branch > summary").click();
+  await page.waitForFunction(() => document.querySelectorAll(".lcm-explorer__content").length === 3);
+  const indents = await page.locator(".lcm-explorer__content").evaluateAll(nodes => nodes.map(node => node.getBoundingClientRect().left));
+  assert(indents[0] < indents[1] && indents[1] < indents[2], "descendants are recursively indented");
+  const root = page.locator(".lcm-explorer");
+  assert(await root.evaluate(node => node.scrollHeight > node.clientHeight), "panel has scrollable overflow");
+  await root.evaluate(node => { node.scrollTop = 200; });
+  assert(await root.evaluate(node => node.scrollTop > 0), "panel actually scrolls");
+  assert.equal(await page.evaluate(() => window.calls.filter(call => call.payload.offset === 24000).length), 0, "full text pages remain lazy");
+  await page.getByRole("button", { name: "Show full summary", exact: true }).first().click();
+  await page.waitForFunction(() => document.querySelector(".lcm-explorer__content").textContent.includes("Final page"));
+  assert.equal(await preview.evaluate(node => node.style.maxHeight), "none");
+  await page.getByRole("button", { name: "Show less", exact: true }).click();
+  assert.notEqual(await preview.evaluate(node => node.style.maxHeight), "none");
+  // Changing the live theme keeps the tree and reading state intact.
+  await page.evaluate(() => document.documentElement.style.setProperty("--accent", "rgb(102, 51, 153)"));
+  assert.equal(await page.locator(".lcm-explorer__kind").first().evaluate(node => getComputedStyle(node).color), "rgb(102, 51, 153)");
+  await page.screenshot({ path: resolve(output, "context-explorer-recursive.png"), fullPage: true });
   const calls = await page.evaluate(() => window.calls);
   assert(calls.every(call => call.method === "plugins.sessionAction" && call.agentId === "main" && call.sessionKey === "agent:main:example"));
   await page.clock.fastForward(3600000);
@@ -83,7 +113,7 @@ try {
   await page.clock.runFor(10000);
   await page.waitForFunction(() => document.querySelector(".lcm-explorer__tail").textContent.includes("25 recent"));
   assert.equal(await page.locator(".lcm-explorer__card[open]").count(), 1);
-  assert.equal(await page.locator(".lcm-explorer__content").count(), 2, "polling preserves expanded details");
+  assert.equal(await page.locator(".lcm-explorer__content").count(), 3, "polling preserves expanded details");
   await page.evaluate(() => { window.fail = true; });
   await page.clock.runFor(10000);
   await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("retrying"));
@@ -110,5 +140,5 @@ try {
   await page.clock.runFor(20000);
   assert.equal(await page.evaluate(() => window.calls.length), disposedCalls, "disposal stops polling");
   assert.deepEqual(errors, []);
-  console.log(`PASS: compact layout, relative ages, automatic refresh/recovery, retained expansion, hidden-panel pause, text safety, session switching, disposal. Screenshots: ${output}`);
+  console.log(`PASS: scrolling, Markdown, bounded previews, full-text paging, recursive descendants, live theme, compact layout, relative ages, automatic refresh/recovery, retained expansion, hidden-panel pause, text safety, session switching, disposal. Screenshots: ${output}`);
 } finally { await browser.close(); await new Promise(done => server.close(done)); }
