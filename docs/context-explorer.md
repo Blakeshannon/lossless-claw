@@ -1,6 +1,6 @@
 # Context explorer
 
-The **Context explorer** session panel shows the summaries retained in this
+The **LCM** session panel (context explorer) shows the summaries retained in this
 session's active Lossless context, in assembly order. It includes readable summary previews, covered dates, stored token estimates,
 expandable Markdown, and recursive source-summary drill-down. `D0`
 summaries summarize messages; `D1` and higher combine earlier summaries at the
@@ -17,7 +17,7 @@ This build targets and was contract-checked against OpenClaw 2026.9.4.
 1. Build/install this Lossless version (`npm run build` includes browser assets).
 2. Enable **Settings → Labs → Custom plugin UI**, then restart the Gateway and
    reload the browser as OpenClaw requests.
-3. Open a session and select its **Context explorer** panel.
+3. Open a session and select its **LCM** panel.
 
 The compact view updates automatically every ten seconds while visible, and
 when reopened or the browser tab becomes visible. There is no Refresh button.

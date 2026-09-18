@@ -427,5 +427,5 @@ export function mount(container: HTMLElement, initial: Context) {
 }
 
 export default { id: "lossless-claw", activate(host: Host) {
-  return host.ui.registerPanel({ id: "context-explorer", label: "Context explorer", mount });
+  return host.ui.registerPanel({ id: "context-explorer", label: "LCM", mount });
 } };
