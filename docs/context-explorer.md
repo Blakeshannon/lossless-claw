@@ -13,6 +13,10 @@ are counted separately; their text is not loaded by the panel.
 Requires OpenClaw **2026.9.2 or newer**. Native session panels first shipped in
 that stable release ([release notes](https://docs.openclaw.ai/releases/2026.9.2)).
 This build targets and was contract-checked against OpenClaw 2026.9.4.
+The browser entry imports the public SDK types from
+`openclaw/plugin-sdk/control-ui`, checked against the minimum supported release
+as a development dependency. These type-only imports add no OpenClaw runtime
+code to the browser bundle; the installed host still supplies the UI facilities.
 
 1. Build/install this Lossless version (`npm run build` includes browser assets).
 2. Enable **Settings → Labs → Custom plugin UI**, then restart the Gateway and

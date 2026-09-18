@@ -1,16 +1,12 @@
+import type { ControlUiPanel, ControlUiPlugin } from "openclaw/plugin-sdk/control-ui";
 import type { ExplorerRepairPlan, ExplorerRepairResult } from "../src/context-explorer-repair.js";
 import type { ExplorerSnapshot, ExplorerSummary, ExplorerDetail, ExplorerHealth } from "../src/context-explorer.js";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import "./context-explorer.css";
 
-// Structural subset of OpenClaw's public ControlUiPlugin v1 contract. Keeping
-// this browser-only avoids importing host code or adding a framework runtime.
-type Context = {
-  props: { sessionKey?: string; agentId?: string }; signal: AbortSignal; presented: boolean;
-  host: { connection: { connected: boolean }; request<T>(method: string, params: Record<string, unknown>): Promise<T> };
-};
-type Host = { ui: { registerPanel(panel: { id: string; label: string; mount: typeof mount }): () => void } };
+// Derive the session context from the SDK panel contract without runtime imports.
+type Context = Parameters<ControlUiPanel["mount"]>[1];
 const number = (value: number) => value.toLocaleString();
 const tokens = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).toFixed(1)}m` : value >= 1000 ? `${(value / 1000).toFixed(1)}k` : number(value);
 function summaryTitle(preview: string | undefined): string {
@@ -426,6 +422,6 @@ export function mount(container: HTMLElement, initial: Context) {
   };
 }
 
-export default { id: "lossless-claw", activate(host: Host) {
+export default { id: "lossless-claw", activate(host) {
   return host.ui.registerPanel({ id: "context-explorer", label: "LCM", mount });
-} };
+} } satisfies ControlUiPlugin;
