@@ -47,6 +47,33 @@ describe("Context explorer", () => {
       expect(() => readContextExplorer(db, "agent:main:a", { summaryId })).toThrow("not found");
     }
   });
+  it("uses doctor's full-content and model detection on roots, descendants, and paged details", () => {
+    const db = fixture();
+    db.prepare("UPDATE summaries SET content = ? WHERE summary_id = 'root-a'")
+      .run("a".repeat(25000) + " [Truncated from 40000 tokens]");
+    db.exec("UPDATE summaries SET model = 'emergency-fallback' WHERE summary_id = 'leaf-a'");
+    const before = db.prepare("SELECT total_changes() AS count").get();
+    const snapshot = readContextExplorer(db, "agent:main:a") as ExplorerSnapshot;
+    expect(snapshot.summaries[0].quality).toBe("new");
+    expect(snapshot.summaries[0]).not.toHaveProperty("content");
+    expect(snapshot.summaries[0]).not.toHaveProperty("model");
+    const detail = readContextExplorer(db, "agent:main:a", { summaryId: "root-a", offset: 24000 }) as ExplorerDetail;
+    expect(detail.quality).toBe("new");
+    expect(detail.children[0].quality).toBe("emergency");
+    expect(detail.children[0]).not.toHaveProperty("content");
+    expect(readContextExplorer(db, "agent:main:a", { check: true })).toMatchObject({ total: 2, truncated: 1, emergency: 1, fallback: 0 });
+    expect(db.prepare("SELECT total_changes() AS count").get()).toEqual(before);
+  });
+  it("checks only the selected active conversation and does not mistake ordinary mentions for markers", () => {
+    const db = fixture();
+    db.exec("UPDATE summaries SET model = 'emergency-fallback' WHERE conversation_id IN (2, 3)");
+    db.exec("UPDATE summaries SET content = 'We discussed fallback summaries and truncation.' WHERE summary_id = 'root-a'");
+    expect(readContextExplorer(db, "agent:main:a", { check: true })).toMatchObject({ total: 0 });
+    db.prepare("UPDATE summaries SET content = ? WHERE summary_id = 'leaf-a'")
+      .run("[LCM fallback summary; truncated for context management] Original discussion");
+    expect(readContextExplorer(db, "agent:main:a", { check: true })).toMatchObject({ total: 1, fallback: 1 });
+    expect(() => readContextExplorer(db, "unknown", { check: true })).toThrow("No active");
+  });
   it("counts conversation messages once and matches doctor compression accounting", () => {
     const db = fixture();
     db.exec(`UPDATE summaries SET source_message_token_count = 600, descendant_token_count = 60 WHERE summary_id = 'root-a';

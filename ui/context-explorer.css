@@ -73,3 +73,10 @@
 .lcm-explorer__expand { padding: 3px 0; border-color: transparent; color: var(--lcm-accent); }
 .lcm-explorer__expand:hover { border-color: transparent; text-decoration: underline; }
 .lcm-explorer__tail { border-top: 1px solid var(--border, currentColor); padding-top: 9px; font-size: 10px; }
+
+.lcm-explorer__health { margin: 6px 0 10px; }
+.lcm-explorer__health-report { font-size: 11px; color: var(--muted, GrayText); margin: 6px 0 0; }
+.lcm-explorer__health-report:empty { display: none; }
+.lcm-explorer__warning-badge { color: var(--warn, var(--text, CanvasText)); font-size: 10px; font-weight: 500; }
+.lcm-explorer__warning { color: var(--warn, var(--text, CanvasText)); background: var(--warn-subtle, transparent); border-left: 2px solid currentColor; padding: 6px 8px; margin: 4px 0 8px; font-size: 11px; }
+.lcm-explorer__row { flex-wrap: wrap; gap: 3px 8px; }

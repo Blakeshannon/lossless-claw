@@ -1,12 +1,13 @@
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "./openclaw-bridge.js";
+import { detectDoctorMarkerForRow, getDoctorSummaryStats, type DoctorMarkerKind } from "./plugin/lcm-doctor-shared.js";
 import { withExclusiveDatabaseLock } from "./transaction-mutex.js";
 
 export type ExplorerSummary = {
   summaryId: string; ordinal: number; kind: string; depth: number;
   tokenCount: number; preview: string; earliestAt: string | null;
   latestAt: string | null; createdAt: string; descendantCount: number;
-  sourceMessageTokenCount: number;
+  sourceMessageTokenCount: number; quality: DoctorMarkerKind | null;
 };
 export type ExplorerSnapshot = {
   basis: "stored-active-context"; capturedAt: string; conversationId: number | null;
@@ -15,10 +16,20 @@ export type ExplorerSnapshot = {
   summaries: ExplorerSummary[]; nextOffset: number | null;
 };
 export type ExplorerDetail = {
-  summaryId: string; content: string; nextOffset: number | null;
+  summaryId: string; content: string; quality: DoctorMarkerKind | null; nextOffset: number | null;
   sourceMessages: number; children: ExplorerSummary[];
   childrenTruncated: boolean;
 };
+
+export type ExplorerHealth = {
+  checkedAt: string; total: number; fallback: number; truncated: number; emergency: number;
+};
+
+type SummaryRow = Omit<ExplorerSummary, "quality"> & { content: string; model: string };
+function withQuality(row: SummaryRow): ExplorerSummary {
+  const { content, model, ...summary } = row;
+  return { ...summary, quality: detectDoctorMarkerForRow({ content, model }) };
+}
 
 function boundedOffset(value: unknown): number {
   if (value === undefined) return 0;
@@ -29,32 +40,39 @@ function boundedOffset(value: unknown): number {
 }
 
 /** SELECT-only view of the current conversation, never archived/session-family history. */
-export function readContextExplorer(db: DatabaseSync, sessionKey: string, input: Record<string, unknown> = {}): ExplorerSnapshot | ExplorerDetail {
+export function readContextExplorer(db: DatabaseSync, sessionKey: string, input: Record<string, unknown> = {}): ExplorerSnapshot | ExplorerDetail | ExplorerHealth {
   const offset = boundedOffset(input.offset);
   const conversation = db.prepare(`SELECT conversation_id FROM conversations
     WHERE session_key = ? AND active = 1 ORDER BY created_at DESC, conversation_id DESC LIMIT 1`)
     .get(sessionKey) as { conversation_id: number } | undefined;
   const id = conversation?.conversation_id;
+  if (input.check === true) {
+    if (!id) throw new Error("No active Lossless conversation for this session");
+    const stats = getDoctorSummaryStats(db, id);
+    return { checkedAt: new Date().toISOString(), total: stats.total,
+      fallback: stats.old + stats.fallback, truncated: stats.truncated, emergency: stats.emergency };
+  }
   if (typeof input.summaryId === "string") {
     if (!id) throw new Error("No active Lossless conversation for this session");
     // A caller cannot use a guessed summary id to read another conversation.
     const row = db.prepare(`SELECT summary_id AS summaryId, substr(content, ?, 24000) AS content,
-      length(content) AS length FROM summaries WHERE conversation_id = ? AND summary_id = ?`)
-      .get(offset + 1, id, input.summaryId) as { summaryId: string; content: string; length: number } | undefined;
+      length(content) AS length, content AS fullContent, model FROM summaries WHERE conversation_id = ? AND summary_id = ?`)
+      .get(offset + 1, id, input.summaryId) as { summaryId: string; content: string; length: number; fullContent: string; model: string } | undefined;
     if (!row) throw new Error("Summary not found in this session");
     const children = db.prepare(`SELECT s.summary_id AS summaryId, p.ordinal, s.kind, s.depth,
-      s.token_count AS tokenCount, substr(s.content, 1, 220) AS preview,
+      s.content, s.model, s.token_count AS tokenCount, substr(s.content, 1, 220) AS preview,
       s.earliest_at AS earliestAt, s.latest_at AS latestAt, s.created_at AS createdAt,
       s.descendant_count AS descendantCount, s.source_message_token_count AS sourceMessageTokenCount
       FROM summary_parents p JOIN summaries s ON s.summary_id = p.parent_summary_id
       WHERE p.summary_id = ? AND s.conversation_id = ? ORDER BY p.ordinal LIMIT 101`)
-      .all(row.summaryId, id) as ExplorerDetail["children"];
+      .all(row.summaryId, id) as SummaryRow[];
     const source = db.prepare(`SELECT count(*) AS count FROM summary_messages sm
       JOIN messages m ON m.message_id = sm.message_id
       WHERE sm.summary_id = ? AND m.conversation_id = ?`).get(row.summaryId, id) as { count: number };
     return { summaryId: row.summaryId, content: row.content,
+      quality: detectDoctorMarkerForRow({ content: row.fullContent, model: row.model }),
       nextOffset: offset + 24000 < row.length ? offset + 24000 : null,
-      sourceMessages: source.count, children: children.slice(0, 100), childrenTruncated: children.length > 100 };
+      sourceMessages: source.count, children: children.slice(0, 100).map(withQuality), childrenTruncated: children.length > 100 };
   }
   const empty: ExplorerSnapshot = { basis: "stored-active-context", capturedAt: new Date().toISOString(),
     conversationId: id ?? null, summaryCount: 0, messageCount: 0, summaryTokens: 0,
@@ -78,13 +96,13 @@ export function readContextExplorer(db: DatabaseSync, sessionKey: string, input:
   const compressionRatio = contextTokens > 0 && totals.compressedTokens > 0
     ? Math.max(1, Math.round(totals.compressedTokens / contextTokens)) : null;
   const rows = db.prepare(`SELECT s.summary_id AS summaryId, c.ordinal, s.kind, s.depth,
-    s.token_count AS tokenCount, substr(s.content, 1, 220) AS preview,
+    s.content, s.model, s.token_count AS tokenCount, substr(s.content, 1, 220) AS preview,
     s.earliest_at AS earliestAt, s.latest_at AS latestAt, s.created_at AS createdAt,
     s.descendant_count AS descendantCount, s.source_message_token_count AS sourceMessageTokenCount
     FROM context_items c JOIN summaries s ON s.summary_id = c.summary_id AND s.conversation_id = c.conversation_id
     WHERE c.conversation_id = ? AND c.item_type = 'summary' ORDER BY c.ordinal LIMIT 51 OFFSET ?`)
-    .all(id, offset) as ExplorerSummary[];
-  return { ...empty, ...totals, conversationTokens, compressionRatio, summaries: rows.slice(0, 50), nextOffset: rows.length > 50 ? offset + 50 : null };
+    .all(id, offset) as SummaryRow[];
+  return { ...empty, ...totals, conversationTokens, compressionRatio, summaries: rows.slice(0, 50).map(withQuality), nextOffset: rows.length > 50 ? offset + 50 : null };
 }
 
 export function registerContextExplorer(api: OpenClawPluginApi, getDb: () => Promise<DatabaseSync>): void {
@@ -92,6 +110,7 @@ export function registerContextExplorer(api: OpenClawPluginApi, getDb: () => Pro
     id: "context-explorer", description: "Read this session's active Lossless summaries and metadata.",
     requiredScopes: ["operator.read"],
     schema: { type: "object", additionalProperties: false, properties: {
+      check: { type: "boolean" },
       summaryId: { type: "string", minLength: 1, maxLength: 200 },
       offset: { type: "integer", minimum: 0, maximum: 10000000 },
     } },

@@ -50,6 +50,23 @@ not raw conversation/context division, a savings percentage, or a billing claim.
 No model calls are made to generate the source-summary titles: these are excerpts
 from the existing summary text.
 
+## Summary quality
+
+Fallback, shortened (truncated), and emergency summaries carry a warning badge,
+including nested source summaries. Opening one explains that the summary may
+omit detail while original messages remain in history. Detection shares doctor’s
+full-content and model-marker logic; it is not inferred from the short preview.
+An unmarked summary is not a guarantee of completeness or accuracy.
+
+**Check summaries** runs the read-only summary-quality portion of doctor for the
+selected active conversation, including stored summaries outside its active
+context. It reports fallback, truncation, and emergency counts inline. It is not
+a full `/lcm doctor` health report and never calls a model or rewrites a summary.
+For the complete report and repair guidance, run `/lcm doctor` in that session.
+The existing repair command is conversation-scoped and has safety preflights;
+the explorer does not offer a misleading single-summary repair button or bypass
+those checks.
+
 ## What “active context” means
 
 This is a coherent snapshot of `context_items` for the active conversation
@@ -82,6 +99,7 @@ Returns `basis: "stored-active-context"`, snapshot time, conversation id, summar
 and message counts/tokens, up to 50 summaries, and a nullable `nextOffset`.
 Use `{ "summaryId": "sum_...", "offset": 0 }` for summary text (24,000-character
 pages), directly linked source-message count, and up to 100 child summaries.
+Use `{ "check": true }` for conversation-scoped summary-quality counts.
 Detail reads enforce the same active-conversation boundary. The browser renders
 Markdown through Marked and a restricted DOMPurify allowlist. Embedded images,
 active HTML, styles, and unsafe links are not rendered. No database path, credentials, or provider

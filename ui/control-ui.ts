@@ -1,4 +1,4 @@
-import type { ExplorerSnapshot, ExplorerSummary, ExplorerDetail } from "../src/context-explorer.js";
+import type { ExplorerSnapshot, ExplorerSummary, ExplorerDetail, ExplorerHealth } from "../src/context-explorer.js";
 import { marked } from "marked";
 import DOMPurify from "dompurify";
 import "./context-explorer.css";
@@ -15,6 +15,14 @@ const tokens = (value: number) => value >= 1_000_000 ? `${(value / 1_000_000).to
 function summaryTitle(preview: string | undefined): string {
   return (preview ?? "").split("\n").find(line => line.trim())?.replace(/^\s*#{1,6}\s*/, "")
     .replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/[*_`]/g, "").trim() || "Earlier discussion";
+}
+function qualityLabel(quality: ExplorerSummary["quality"]): string {
+  return quality === "new" ? "Shortened summary" : quality === "emergency" ? "Emergency summary" : "Fallback summary";
+}
+function qualityDescription(quality: ExplorerSummary["quality"]): string {
+  return quality === "new"
+    ? "This summary was truncated and may omit detail. Your original messages are still in history."
+    : "This summary used a fallback instead of a complete model-generated summary and may omit detail. Your original messages are still in history.";
 }
 function el<K extends keyof HTMLElementTagNameMap>(tag: K, text = "", className = ""): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag); node.textContent = text; node.className = className; return node;
@@ -39,6 +47,7 @@ function age(value: string | null): string {
 
 export function mount(container: HTMLElement, initial: Context) {
   let context = initial, disposed = false, generation = 0, loading = false;
+  let checking = false;
   let nextOffset: number | null = null, lastSignature = "", queued = false;
   const previewObservers = new Map<ResizeObserver, HTMLElement>();
   const root = el("section", "", "lcm-explorer");
@@ -53,7 +62,13 @@ export function mount(container: HTMLElement, initial: Context) {
   const more = el("button", "Load more summaries", "lcm-explorer__button"); more.type = "button"; more.hidden = true;
   const tail = el("p", "", "lcm-explorer__tail");
   header.append(status);
-  root.append(header, overview, stats, list, more, tail); container.append(root);
+  const health = el("div", "", "lcm-explorer__health");
+  const check = el("button", "Check summaries", "lcm-explorer__button");
+  check.type = "button"; check.disabled = true;
+  check.title = "Run doctor’s read-only fallback and truncation checks for this conversation. No model calls or repairs.";
+  const report = el("p", "", "lcm-explorer__health-report"); report.setAttribute("role", "status");
+  health.append(check, report);
+  root.append(header, overview, stats, health, list, more, tail); container.append(root);
 
   function alive(epoch: number) { return !disposed && !context.signal.aborted && epoch === generation; }
   async function request<T>(payload: Record<string, unknown>): Promise<T> {
@@ -79,7 +94,10 @@ export function mount(container: HTMLElement, initial: Context) {
       : `Coverage unknown. Summary created: ${date(summary.createdAt)}`;
     relativeAge.textContent = age(relativeAge.dataset.timestamp);
     relativeAge.setAttribute("aria-label", `${relativeAge.textContent} ago. ${relativeAge.title}`);
-    labels.append(relativeAge);
+    const badge = el("span", "", "lcm-explorer__warning-badge");
+    badge.hidden = !summary.quality;
+    if (summary.quality) { badge.textContent = `⚠ ${qualityLabel(summary.quality)}`; badge.title = qualityDescription(summary.quality); }
+    labels.append(badge, relativeAge);
     const title = summaryTitle(summary.preview);
     top.title = title;
     top.append(el("div", title, "lcm-explorer__title"), labels);
@@ -94,7 +112,10 @@ export function mount(container: HTMLElement, initial: Context) {
       metadata.append(coverage);
     }
     if (summary.sourceMessageTokenCount > 0) metadata.append(el("span", `Distilled from ${tokens(summary.sourceMessageTokenCount)} tokens`));
-    body.append(metadata); card.append(top, body);
+    const warning = el("p", "", "lcm-explorer__warning");
+    warning.hidden = !summary.quality;
+    if (summary.quality) warning.textContent = qualityDescription(summary.quality);
+    body.append(warning, metadata); card.append(top, body);
     let loaded = false, pending = false;
     card.addEventListener("toggle", () => {
       if (!card.open || loaded || pending) return;
@@ -129,6 +150,15 @@ export function mount(container: HTMLElement, initial: Context) {
       const detail = await request<ExplorerDetail>({ summaryId });
       if (!alive(epoch) || !target.isConnected) return false;
       message.remove();
+      // A manual check/detail read can observe a repair before the next snapshot poll.
+      if (detail.quality !== undefined) {
+        const card = target.parentElement!;
+        const badge = card.querySelector<HTMLElement>(":scope > summary .lcm-explorer__warning-badge")!;
+        const warning = target.querySelector<HTMLElement>(":scope > .lcm-explorer__warning")!;
+        badge.hidden = warning.hidden = !detail.quality;
+        badge.textContent = detail.quality ? `⚠ ${qualityLabel(detail.quality)}` : "";
+        badge.title = warning.textContent = detail.quality ? qualityDescription(detail.quality) : "";
+      }
       if (summary.kind === "leaf") target.append(el("p", `From ${number(detail.sourceMessages)} message${detail.sourceMessages === 1 ? "" : "s"}`, "lcm-explorer__muted lcm-explorer__sources"));
       const preview = el("div", "", "lcm-explorer__preview");
       const text = el("div", "", "lcm-explorer__content"); preview.append(text); target.append(preview);
@@ -206,6 +236,7 @@ export function mount(container: HTMLElement, initial: Context) {
     try {
       const snapshot = await request<ExplorerSnapshot>({ offset: append ? nextOffset ?? 0 : 0 });
       if (!alive(epoch)) return;
+      check.disabled = checking || snapshot.conversationId === null;
       // Refresh pages already opened by the user, retaining their reading position.
       const visibleCount = list.children.length;
       while (!append && snapshot.nextOffset !== null && snapshot.summaries.length < visibleCount) {
@@ -261,6 +292,25 @@ export function mount(container: HTMLElement, initial: Context) {
       if (queued) { queued = false; void reload(); }
     }
   }
+  check.onclick = async () => {
+    const epoch = generation;
+    checking = true; check.disabled = true; report.textContent = "Checking summaries…";
+    try {
+      const result = await request<ExplorerHealth>({ check: true });
+      if (!alive(epoch)) return;
+      const counts = [result.fallback ? `${number(result.fallback)} fallback` : "",
+        result.truncated ? `${number(result.truncated)} shortened` : "",
+        result.emergency ? `${number(result.emergency)} emergency` : ""].filter(Boolean);
+      report.textContent = result.total
+        ? `${number(result.total)} ${result.total === 1 ? "summary needs" : "summaries need"} attention: ${counts.join(", ")}. Includes earlier summaries, not just those in context. Run /lcm doctor in chat to review repair options.`
+        : "No fallback or truncation markers found in this conversation’s summaries.";
+      report.title = `Checked ${new Date(result.checkedAt).toLocaleTimeString()}. Summary-quality check only, not a full health diagnosis. No changes made.`;
+    } catch {
+      if (alive(epoch)) report.textContent = "Could not check summaries. Try again.";
+    } finally {
+      if (alive(epoch)) { checking = false; check.disabled = false; }
+    }
+  };
   more.onclick = () => void reload(true);
   const resume = () => { void reload(); };
   const timer = setInterval(resume, 10000);
@@ -272,7 +322,7 @@ export function mount(container: HTMLElement, initial: Context) {
     update(next: Context) {
       const changed = next.props.sessionKey !== context.props.sessionKey || next.props.agentId !== context.props.agentId;
       context = next;
-      if (changed) { for (const observer of previewObservers.keys()) observer.disconnect(); previewObservers.clear(); generation++; lastSignature = ""; nextOffset = null; list.replaceChildren(); overview.replaceChildren(); stats.replaceChildren(); tail.textContent = ""; more.hidden = true; status.textContent = "Loading context…"; }
+      if (changed) { for (const observer of previewObservers.keys()) observer.disconnect(); previewObservers.clear(); generation++; checking = false; report.textContent = ""; report.title = ""; check.disabled = true; lastSignature = ""; nextOffset = null; list.replaceChildren(); overview.replaceChildren(); stats.replaceChildren(); tail.textContent = ""; more.hidden = true; status.textContent = "Loading context…"; }
       void reload();
     },
     dispose,

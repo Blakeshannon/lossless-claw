@@ -35,7 +35,7 @@ try {
       summaries: [
         { summaryId: "sum_a83d2b", ordinal: 0, kind: "condensed", depth: 2, tokenCount: 6840,
           preview: "Context architecture & design decisions", earliestAt: "2026-09-14", latestAt: "2026-09-14T12:00:00Z", createdAt: "2026-09-16", descendantCount: 18, sourceMessageTokenCount: 186000 },
-        { summaryId: "sum_c91e5f", ordinal: 1, kind: "condensed", depth: 1, tokenCount: 3920,
+        { summaryId: "sum_c91e5f", ordinal: 1, quality: "new", kind: "condensed", depth: 1, tokenCount: 3920,
           preview: "Search semantics and session boundaries", earliestAt: "2026-09-16", latestAt: "2026-09-17T12:00:00Z", createdAt: "2026-09-17", descendantCount: 6, sourceMessageTokenCount: 52000 },
         { summaryId: "sum_f24a8c", ordinal: 2, kind: "leaf", depth: 0, tokenCount: 1660,
           preview: "A read-only explorer beside the conversation", earliestAt: "2026-09-18", latestAt: "2026-09-18T07:00:00Z", createdAt: "2026-09-18", descendantCount: 0, sourceMessageTokenCount: 12000 },
@@ -50,11 +50,12 @@ try {
         if (window.fail) throw new Error("Network unavailable");
         if (window.delay) await new Promise(done => { window.release = done; });
         if (params.sessionKey === "agent:other:empty") return { ok: true, result: { ...snapshot, conversationId: null, summaryCount: 0, summaries: [] } };
+        if (params.payload.check) return { ok: true, result: { checkedAt: new Date().toISOString(), total: 2, fallback: 0, truncated: 1, emergency: 1 } };
         if (params.payload.summaryId) return { ok: true, result: { summaryId: params.payload.summaryId,
           content: params.payload.offset ? "\n\n## Final page\nLast paragraph." : window.summaryText,
           nextOffset: params.payload.offset ? null : 24000, sourceMessages: 12,
           children: params.payload.summaryId === "sum_a83d2b" ? [{ summaryId: "sum_child", kind: "condensed", depth: 1, preview: "Choosing a read-only, session-scoped design", tokenCount: 920, createdAt: "2026-09-17", descendantCount: 1, sourceMessageTokenCount: 10000 }] :
-            params.payload.summaryId === "sum_child" ? [{ summaryId: "sum_grandchild", kind: "leaf", depth: 0, preview: "Sidebar layout and safe Markdown rendering", tokenCount: 420, createdAt: "2026-09-17", descendantCount: 0, sourceMessageTokenCount: 5000 }] : [], childrenTruncated: false } };
+            params.payload.summaryId === "sum_child" ? [{ summaryId: "sum_grandchild", quality: "emergency", kind: "leaf", depth: 0, preview: "Sidebar layout and safe Markdown rendering", tokenCount: 420, createdAt: "2026-09-17", descendantCount: 0, sourceMessageTokenCount: 5000 }] : [], childrenTruncated: false } };
         return { ok: true, result: snapshot };
       },
     };
@@ -114,6 +115,16 @@ try {
   assert((await page.locator(".lcm-explorer__branch > summary").first().textContent()).includes("Choosing a read-only"));
   await root.evaluate(node => { node.scrollTop = 0; });
   await page.screenshot({ path: resolve(output, "context-explorer-polished.png"), fullPage: true });
+  assert.match(await page.locator('.lcm-explorer__list > .lcm-explorer__card').nth(1).locator('.lcm-explorer__warning-badge').textContent(), /Shortened summary/);
+  assert.match(await page.locator('[data-summary-id="sum_grandchild"] > summary .lcm-explorer__warning-badge').textContent(), /Emergency summary/);
+  assert.match(await page.locator('[data-summary-id="sum_grandchild"] > .lcm-explorer__body > .lcm-explorer__warning').textContent(), /original messages/);
+  await page.getByRole("button", { name: "Check summaries", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.lcm-explorer__health-report').textContent.includes('2 summaries need attention'));
+  assert.equal(await page.evaluate(() => window.calls.filter(call => call.payload.check === true).length), 1);
+  await page.evaluate(() => { window.fail = true; });
+  await page.getByRole("button", { name: "Check summaries", exact: true }).click();
+  await page.waitForFunction(() => document.querySelector('.lcm-explorer__health-report').textContent.includes('Try again'));
+  await page.evaluate(() => { window.fail = false; });
   const calls = await page.evaluate(() => window.calls);
   assert(calls.every(call => call.method === "plugins.sessionAction" && call.agentId === "main" && call.sessionKey === "agent:main:example"));
   await page.clock.fastForward(3600000);
@@ -142,6 +153,7 @@ try {
   });
   await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("not recorded"));
   assert.equal(await page.locator(".lcm-explorer__list > .lcm-explorer__card").count(), 0, "old session's response must not repaint the new session");
+  assert.equal(await page.locator(".lcm-explorer__health-report").textContent(), "", "session switch clears diagnostics");
   assert.equal((await page.evaluate(() => window.calls)).at(-1).agentId, "other");
   await page.evaluate(() => window.controller.abort());
   assert.equal(await page.locator(".lcm-explorer").count(), 0);
