@@ -22,6 +22,8 @@ when reopened or the browser tab becomes visible. There is no Refresh button.
 Short ages (`4d`, `1d`, `5h`) refer to the latest covered content, falling back
 to summary creation time when coverage is unknown. Hover for exact dates.
 Unchanged summary rows retain their expanded text during automatic updates.
+Colors, accents, focus outlines, and the UI font follow the selected OpenClaw
+theme automatically, including theme changes while the panel is open.
 It uses the authenticated session-action transport with `operator.read`, passing
 both the panel's session key and agent identity. It makes no model calls, sends
 no data to external services, and performs no database mutations.
