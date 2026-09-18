@@ -1,5 +1,5 @@
 ---
-"@martian-engineering/lossless-claw": major
+"@martian-engineering/lossless-claw": minor
 ---
 
 Add a read-only Context explorer native session panel with active-summary
