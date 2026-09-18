@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import { selectOverflowToolGroup } from "./overflow-tool-groups.js";
 import { contentFromParts } from "./assembler.js";
 import type {
   ConversationStore,
@@ -850,6 +851,8 @@ export class CompactionEngine {
 
   /** Run a full compaction sweep for a conversation. */
   async compact(input: {
+    /** Only after authoritative forced-recovery transcript reconciliation. */
+    allowCurrentTurnCompaction?: boolean;
     conversationId: number;
     tokenBudget: number;
     contextThreshold?: number;
@@ -1034,6 +1037,8 @@ export class CompactionEngine {
    *          remains high enough to be worthwhile.
    */
   async compactFullSweep(input: {
+    /** Only after authoritative forced-recovery transcript reconciliation. */
+    allowCurrentTurnCompaction?: boolean;
     conversationId: number;
     tokenBudget: number;
     contextThreshold?: number;
@@ -1059,7 +1064,10 @@ export class CompactionEngine {
     onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
-    const freshTailCountOverride = input.freshTailCount;
+    // Recovery always retains the initiating user, even when routine tail protection is disabled.
+    const freshTailCountOverride = input.allowCurrentTurnCompaction
+      ? Math.max(1, input.freshTailCount ?? this.resolveFreshTailCount())
+      : input.freshTailCount;
     const leafChunkTokensOverride = input.leafChunkTokens;
 
     const tokensBefore = await this.summaryStore.getContextTokenCount(conversationId);
@@ -1166,12 +1174,17 @@ export class CompactionEngine {
       if (sweepBudgetExhausted("leaf")) {
         break;
       }
-      const leafChunk = await this.selectOldestLeafChunk(
+      let leafChunk = await this.selectOldestLeafChunk(
         conversationId,
         leafChunkTokensOverride,
         freshTailCountOverride,
         leafScanAfterOrdinal,
       );
+      if (leafChunk.items.length === 0 && input.allowCurrentTurnCompaction) {
+        leafChunk = await this.selectOverflowLeafChunk(
+          conversationId, freshTailCountOverride, leafScanAfterOrdinal, leafChunkTokensOverride,
+        );
+      }
       if (leafChunk.items.length === 0) {
         break;
       }
@@ -1371,6 +1384,8 @@ export class CompactionEngine {
 
   /** Compact until under the requested target, running up to maxRounds. */
   async compactUntilUnder(input: {
+    /** Only after authoritative forced-recovery transcript reconciliation. */
+    allowCurrentTurnCompaction?: boolean;
     conversationId: number;
     tokenBudget: number;
     contextThreshold?: number;
@@ -1387,6 +1402,8 @@ export class CompactionEngine {
   }
 
   private async _compactUntilUnderImpl(input: {
+    /** Only after authoritative forced-recovery transcript reconciliation. */
+    allowCurrentTurnCompaction?: boolean;
     conversationId: number;
     tokenBudget: number;
     contextThreshold?: number;
@@ -1456,6 +1473,7 @@ export class CompactionEngine {
       let result: CompactionResult;
       try {
         result = await this.compact({
+          ...(input.allowCurrentTurnCompaction ? { allowCurrentTurnCompaction: true } : {}),
           conversationId,
           tokenBudget,
           contextThreshold: input.contextThreshold,
@@ -1797,6 +1815,27 @@ export class CompactionEngine {
     }
 
     return { items: chunk, rawTokensOutsideTail, threshold };
+  }
+
+  /** Select one complete in-turn group without weakening routine fresh-tail selection. */
+  private async selectOverflowLeafChunk(
+    conversationId: number,
+    freshTailCountOverride?: number,
+    afterOrdinal?: number,
+    leafChunkTokensOverride?: number,
+  ): Promise<LeafChunkSelection> {
+    const chunkTokens = this.resolveLeafChunkTokens(leafChunkTokensOverride);
+    const context = [];
+    for (const item of await this.getContextItemsCached(conversationId)) {
+      const message = item.messageId == null ? null : await this.conversationStore.getMessageById(item.messageId);
+      const parts = message ? await this.conversationStore.getMessageParts(message.messageId) : [];
+      context.push({ item, message, parts });
+    }
+    return {
+      items: selectOverflowToolGroup(context, freshTailCountOverride ?? this.resolveFreshTailCount(), this.resolveFreshTailMaxTokens(), afterOrdinal, chunkTokens),
+      rawTokensOutsideTail: 0,
+      threshold: chunkTokens,
+    };
   }
 
   /**

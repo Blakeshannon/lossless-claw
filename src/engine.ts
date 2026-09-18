@@ -252,6 +252,8 @@ const PENDING_SUMMARY_MODEL_UNAVAILABLE_REASON = "pending summary model unavaila
 /** Stop bypassing compaction backoff after repeated emergency failures. */
 const ASSEMBLE_FORCE_MAX_RETRY_ATTEMPTS = 3;
 type CompactionExecutionParams = {
+  /** Authoritative forced-recovery snapshot is fully reconciled. */
+  allowCurrentTurnCompaction?: boolean;
   conversationId: number;
   sessionId: string;
   sessionKey?: string;
@@ -615,7 +617,7 @@ export class LcmContextEngine implements ContextEngine {
       id: "lossless-claw",
       name: "Lossless Context Management Engine",
       version: packageJson.version,
-      acceptedHostParams: ["sessionKey", "prompt", "runtimeContext", "runtimeSettings"],
+      acceptedHostParams: ["sessionKey", "sessionTarget", "prompt", "runtimeContext", "runtimeSettings"],
       transcriptSemantics: {
         currentTurnFence: "before-current-turn-entry-v1",
         turnAdvancementIdempotency: "atomic-idempotent-v1",
@@ -2353,6 +2355,7 @@ export class LcmContextEngine implements ContextEngine {
           ? tokenBudget
           : undefined;
     const compactResult = await this.compaction.compactUntilUnder({
+      ...(params.allowCurrentTurnCompaction ? { allowCurrentTurnCompaction: true } : {}),
       conversationId,
       tokenBudget,
       contextThreshold: resolvedContextThreshold.contextThreshold,
@@ -2735,6 +2738,8 @@ export class LcmContextEngine implements ContextEngine {
     conversationId: number;
     historicalMessages: AgentMessage[];
     requireOverlap?: boolean;
+    /** Import the full host-owned snapshot during foreground overflow recovery. */
+    completeRecoverySnapshot?: boolean;
     legacyPrefixAnchorEntryId?: string | null;
   }): Promise<TranscriptReconcileResult> {
     let importedMessages = 0;
@@ -2988,9 +2993,9 @@ export class LcmContextEngine implements ContextEngine {
     const anchoredImportableMessages = importableMessages.filter(
       (candidate) => candidate.index > importBoundaryIndex,
     );
-    const importCap = transcriptImportCap(
-      await this.conversationStore.getMessageCount(params.conversationId),
-    );
+    const importCap = params.completeRecoverySnapshot
+      ? anchoredImportableMessages.length
+      : transcriptImportCap(await this.conversationStore.getMessageCount(params.conversationId));
     const cappedByImportLimit = anchoredImportableMessages.length > importCap;
     const messagesToImport = cappedByImportLimit
       ? anchoredImportableMessages.slice(0, importCap)
@@ -5208,9 +5213,64 @@ export class LcmContextEngine implements ContextEngine {
     return this.compaction.evaluateLeafTrigger(conversation.conversationId);
   }
 
+  /** Reconcile the complete recovery snapshot while the caller owns the session queue. */
+  private async reconcileOverflowTranscript(target: SessionTranscriptReadTarget): Promise<string | undefined> {
+    const read = this.deps.readVisibleSessionTranscriptMessageEntries;
+    if (!read) return "visible transcript projection unavailable";
+    const entries = await read(target);
+    if (entries.length === 0) return "no visible transcript messages for overflow recovery";
+    const latestUserIndex = entries.findLastIndex((entry) => entry.message.role === "user");
+    if (latestUserIndex < 0) return "no initiating user in overflow transcript";
+    const ids = entries.map((entry) => entry.entryId);
+    if (ids.some((id) => !id?.trim()) || new Set(ids).size !== ids.length) {
+      return "ambiguous visible transcript identities for overflow recovery";
+    }
+
+    // Retain every source row before changing context projection. Bootstrap's
+    // suffix budget is inappropriate here: the omitted tool groups need summaries.
+    return this.conversationStore.withTransaction(async () => {
+      await this.archiveSupersededIsolatedCronConversation(target);
+      const conversation = await this.conversationStore.getOrCreateConversation(target.sessionId, {
+        sessionKey: target.sessionKey,
+      });
+      const conversationId = conversation.conversationId;
+      const existingCount = await this.conversationStore.getMessageCount(conversationId);
+      const audit = existingCount > 0
+        ? await this.auditTranscriptAnchorsForProjection({ ...target, conversationId, entries })
+        : undefined;
+      const reconcile = await this.reconcileProjectedTranscriptMessages({
+        ...target,
+        conversationId,
+        historicalMessages: entries.map(messageFromVisibleTranscriptEntry),
+        requireOverlap: existingCount > 0 && !audit?.allowsUnanchoredLegacyPrefixImport,
+        legacyPrefixAnchorEntryId: audit?.legacyPrefixAnchorEntryId,
+        completeRecoverySnapshot: true,
+      });
+      if (reconcile.blockedByImportCap) {
+        throw new Error(`overflow transcript reconciliation blocked: ${reconcile.blockedReason ?? "incomplete coverage"}`);
+      }
+      // Reconciliation may deliberately skip uncertain history. Only a fully
+      // represented current turn may authorize the recovery-only tail exception.
+      const turnIds = new Set(ids.slice(latestUserIndex));
+      const storedIds = await this.conversationStore.filterExistingTranscriptEntryIds(conversationId, [...turnIds]);
+      const context = await this.summaryStore.getContextItems(conversationId);
+      const raw = await Promise.all(context.filter((item) => item.messageId != null)
+        .map((item) => this.conversationStore.getMessageById(item.messageId!)));
+      const userIndex = raw.findLastIndex((message) => message?.role === "user");
+      if (storedIds.size !== turnIds.size || userIndex < 0 ||
+          raw[userIndex]?.transcriptEntryId !== ids[latestUserIndex] ||
+          raw.slice(userIndex).some((message) => !message?.transcriptEntryId || !turnIds.has(message.transcriptEntryId))) {
+        throw new Error("overflow transcript has incomplete current-turn coverage");
+      }
+      await this.conversationStore.markConversationBootstrapped(conversationId);
+      return undefined;
+    });
+  }
+
   async compact(params: {
     sessionId: string;
     sessionKey?: string;
+    sessionTarget?: ContextEngineSessionTarget;
     sessionFile: string;
     tokenBudget?: number;
     currentTokenCount?: number;
@@ -5226,6 +5286,12 @@ export class LcmContextEngine implements ContextEngine {
     /** Force compaction even if below threshold */
     force?: boolean;
   }): Promise<CompactResult> {
+    const recoveryTarget = params.force === true && params.compactionTarget === "budget"
+      ? resolveSessionTranscriptReadTarget(params)
+      : undefined;
+    if (recoveryTarget) {
+      params = { ...params, sessionId: recoveryTarget.sessionId, sessionKey: recoveryTarget.sessionKey };
+    }
     if (this.shouldIgnoreSession({ sessionId: params.sessionId, sessionKey: params.sessionKey })) {
       if (this.deps.delegateCompactionToRuntime) {
         // Excluded sessions get no LCM tracking, so delegate to OpenClaw's
@@ -5258,6 +5324,16 @@ export class LcmContextEngine implements ContextEngine {
     return this.withSessionQueue(
       this.resolveSessionQueueKey(params.sessionId, params.sessionKey),
       async () => {
+        const authoritativeRecovery = recoveryTarget !== undefined &&
+          this.deps.readVisibleSessionTranscriptMessageEntries !== undefined;
+        if (authoritativeRecovery) {
+          try {
+            const reason = await this.reconcileOverflowTranscript(recoveryTarget);
+            if (reason) return { ok: false, compacted: false, reason };
+          } catch (error) {
+            return { ok: false, compacted: false, reason: `overflow transcript unavailable: ${describeLogError(error)}` };
+          }
+        }
         const conversation = await this.conversationStore.getConversationForSession({
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -5276,7 +5352,10 @@ export class LcmContextEngine implements ContextEngine {
           Math.floor(this.config.maxSweepIterations),
           (await this.summaryStore.getContextItems(conversation.conversationId)).length * 2 + 8,
         );
-        const result = await this.executePendingCompactionCore({
+        // Pending preparation only compacts a prefix. Recovery may instead
+        // summarize completed groups after the retained initiating user.
+        const execution = {
+          ...(authoritativeRecovery ? { allowCurrentTurnCompaction: true } : {}),
           conversationId: conversation.conversationId,
           sessionId: params.sessionId,
           sessionKey: params.sessionKey,
@@ -5291,7 +5370,10 @@ export class LcmContextEngine implements ContextEngine {
           force: params.force,
           sessionQueueHeld: true,
           maxPendingSteps: manualPendingStepCap,
-        });
+        };
+        const result: CompactResult & { pending?: boolean } = authoritativeRecovery
+          ? await this.executeCompactionCore(execution)
+          : await this.executePendingCompactionCore(execution);
         if (result.compacted && result.pending !== true) {
           await this.compactionMaintenanceStore.markProactiveCompactionFinished({
             conversationId: conversation.conversationId,

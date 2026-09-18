@@ -1517,6 +1517,7 @@ export class ContextAssembler {
     // Step 2: Resolve each context item into a ResolvedItem, then apply any
     // active focus overlay without mutating canonical context_items rows.
     const canonicalResolved = await this.resolveItems(contextItems);
+    await this.preserveCurrentUserBoundary(canonicalResolved);
     const resolved = await this.applyFocusOverlay(conversationId, canonicalResolved);
 
     // Count stats from the full (pre-truncation) set
@@ -1837,6 +1838,27 @@ export class ContextAssembler {
     return resolved;
   }
 
+  /** Keep tool-only summaries inside a raw user turn from creating a synthetic user boundary. */
+  private async preserveCurrentUserBoundary(items: ResolvedItem[]): Promise<void> {
+    const user = items.findLast((item) => item.isMessage && item.sourceRole === "user");
+    if (!user) return;
+    for (const item of items) {
+      if (!item.summary || item.summary.kind !== "leaf" || item.ordinal <= user.ordinal) continue;
+      const sourceIds = await this.summaryStore.getSummaryMessages(item.summary.summaryId);
+      const sources = await Promise.all(sourceIds.map((id) => this.conversationStore.getMessageById(id)));
+      // Only proven assistant/tool history can use this representation. Prefix
+      // summaries retain their user role, including the first-message guarantee.
+      if (!sources.some((source) => source?.role === "assistant") ||
+          !sources.some((source) => source?.role === "tool") ||
+          sources.some((source) => !source ||
+            (source.role !== "assistant" && source.role !== "tool"))) continue;
+      item.message = {
+        role: "assistant",
+        content: [{ type: "text", text: String(item.message.content) }],
+      } as AgentMessage;
+    }
+  }
+
   /**
    * Resolve a single context item.
    */
@@ -1995,16 +2017,10 @@ export class ContextAssembler {
         ? await this.summaryStore.getSummaryMessageSeqRange(summary.summaryId)
         : { maxSeq: null };
 
-    // Summaries are synthetic user messages — content carries a
-    // trust="untrusted" taint label on the <summary> tag to mitigate
-    // injection persistence (semantics defined in the recall system prompt).
-    //
-    // NOTE: the role stays "user" deliberately. A non-user role would be
-    // stronger (issue #71 rec. 1), but neither available runtime role is safe
-    // here: "toolResult" has no paired tool call and is dropped by
-    // sanitizeToolUseResultPairing, and "assistant" risks provider
-    // first-message/alternation constraints handled only by OpenClaw upstream.
-    // Downgrading the role requires upstream support; tracked in issue #71.
+    // Prefix summaries use the user role so a projection can start with them.
+    // The wrapper remains explicitly untrusted. Tool-only summaries inside a
+    // retained raw user turn are rendered as assistant history by
+    // preserveCurrentUserBoundary; they must not replace the initiating user.
     return {
       ordinal: item.ordinal,
       message: { role: "user" as const, content } as AgentMessage,
