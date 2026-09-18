@@ -57,6 +57,17 @@ export interface CompactionResult {
   stoppedAtBudget?: boolean;
 }
 
+/** Outcome of bounded recovery, separating attempted rounds from committed work. */
+export interface CompactUntilUnderResult {
+  success: boolean;
+  rounds: number;
+  finalTokens: number;
+  actionTaken: boolean;
+  authFailure?: boolean;
+  /** Failure after zero or more committed passes; partial progress remains usable. */
+  error?: Error;
+}
+
 export interface CompactionConfig {
   /** Context threshold as fraction of budget (default 0.75) */
   contextThreshold: number;
@@ -853,6 +864,8 @@ export class CompactionEngine {
     summaryModel?: string;
     /** Optional operation-wide wall-clock deadline shared across rounds. */
     operationDeadlineAt?: number;
+    /** Report each committed pass even if a later pass throws. */
+    onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
     return this.withContextCache(() => this.compactFullSweep(input));
   }
@@ -1042,6 +1055,8 @@ export class CompactionEngine {
      * the whole operation run `maxRounds × sweepDeadlineMs`.
      */
     operationDeadlineAt?: number;
+    /** Report each committed pass even if a later pass throws. */
+    onPassCommitted?: (tokensAfter: number) => void;
   }): Promise<CompactionResult> {
     const { conversationId, tokenBudget, summarize, force, hardTrigger } = input;
     const freshTailCountOverride = input.freshTailCount;
@@ -1188,6 +1203,7 @@ export class CompactionEngine {
         continue;
       }
       const passTokensAfter = Math.max(0, passTokensBefore - leafResult.removedTokens + leafResult.addedTokens);
+      input.onPassCommitted?.(passTokensAfter);
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -1265,6 +1281,7 @@ export class CompactionEngine {
         return "no-progress";
       }
       const passTokensAfter = Math.max(0, passTokensBefore - condenseResult.removedTokens + condenseResult.addedTokens);
+      input.onPassCommitted?.(passTokensAfter);
       await this.persistCompactionEvents({
         conversationId,
         tokensBefore: passTokensBefore,
@@ -1365,7 +1382,7 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
-  }): Promise<{ success: boolean; rounds: number; finalTokens: number; authFailure?: boolean }> {
+  }): Promise<CompactUntilUnderResult> {
     return this.withContextCache(() => this._compactUntilUnderImpl(input));
   }
 
@@ -1381,7 +1398,7 @@ export class CompactionEngine {
     currentTokens?: number;
     summarize: CompactionSummarizeFn;
     summaryModel?: string;
-  }): Promise<{ success: boolean; rounds: number; finalTokens: number; authFailure?: boolean }> {
+  }): Promise<CompactUntilUnderResult> {
     const { conversationId, tokenBudget, summarize } = input;
     const targetTokens =
       typeof input.targetTokens === "number" &&
@@ -1398,12 +1415,14 @@ export class CompactionEngine {
         ? Math.floor(input.currentTokens)
         : 0;
     let lastTokens = Math.max(storedTokens, liveTokens);
+    let actionTaken = false;
+    let committedTokens = storedTokens;
 
     // For forced overflow recovery, callers may pass an observed count that
     // equals the context budget. Treat equality as still needing a compaction
     // attempt so we can create headroom for provider-side framing overhead.
     if (lastTokens < targetTokens) {
-      return { success: true, rounds: 0, finalTokens: lastTokens };
+      return { success: true, rounds: 0, finalTokens: lastTokens, actionTaken };
     }
 
     // Operation-wide wall-clock bound. Each round runs a compactFullSweep that
@@ -1430,30 +1449,51 @@ export class CompactionEngine {
           success: lastTokens <= targetTokens,
           rounds: round - 1,
           finalTokens: lastTokens,
+          actionTaken,
         };
       }
 
-      const result = await this.compact({
-        conversationId,
-        tokenBudget,
-        contextThreshold: input.contextThreshold,
-        ...(input.freshTailCount !== undefined
-          ? { freshTailCount: input.freshTailCount }
-          : {}),
-        ...(input.leafChunkTokens !== undefined
-          ? { leafChunkTokens: input.leafChunkTokens }
-          : {}),
-        summarize,
-        force: true,
-        summaryModel: input.summaryModel,
-        operationDeadlineAt,
-      });
+      let result: CompactionResult;
+      try {
+        result = await this.compact({
+          conversationId,
+          tokenBudget,
+          contextThreshold: input.contextThreshold,
+          ...(input.freshTailCount !== undefined
+            ? { freshTailCount: input.freshTailCount }
+            : {}),
+          ...(input.leafChunkTokens !== undefined
+            ? { leafChunkTokens: input.leafChunkTokens }
+            : {}),
+          summarize,
+          force: true,
+          summaryModel: input.summaryModel,
+          operationDeadlineAt,
+          onPassCommitted: (tokensAfter) => {
+            actionTaken = true;
+            committedTokens = tokensAfter;
+          },
+        });
+      } catch (error) {
+        // A sweep may commit several passes before a provider or storage error.
+        // Preserve those commits without inferring work from token estimates.
+        return {
+          success: false,
+          rounds: round,
+          finalTokens: committedTokens,
+          actionTaken,
+          error: error instanceof Error ? error : new Error(String(error)),
+        };
+      }
+      actionTaken ||= result.actionTaken;
+      committedTokens = result.tokensAfter;
 
       if (result.authFailure) {
         return {
           success: false,
           rounds: round,
           finalTokens: result.tokensAfter,
+          actionTaken,
           authFailure: true,
         };
       }
@@ -1463,6 +1503,7 @@ export class CompactionEngine {
           success: true,
           rounds: round,
           finalTokens: result.tokensAfter,
+          actionTaken,
         };
       }
 
@@ -1472,6 +1513,7 @@ export class CompactionEngine {
           success: false,
           rounds: round,
           finalTokens: result.tokensAfter,
+          actionTaken,
         };
       }
 
@@ -1484,6 +1526,7 @@ export class CompactionEngine {
       success: finalTokens <= targetTokens,
       rounds: this.config.maxRounds,
       finalTokens,
+      actionTaken,
     };
   }
 
