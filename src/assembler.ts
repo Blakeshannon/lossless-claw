@@ -1838,20 +1838,46 @@ export class ContextAssembler {
     return resolved;
   }
 
-  /** Keep tool-only summaries inside a raw user turn from creating a synthetic user boundary. */
+  /** Prove that every source in a summary DAG is assistant/tool history after this user. */
+  private async isCurrentTurnToolSummary(summary: SummaryRecord, userSeq: number): Promise<boolean> {
+    const pending = [summary];
+    const visited = new Set<string>();
+    let hasAssistant = false;
+    let hasTool = false;
+    while (pending.length > 0) {
+      const current = pending.pop()!;
+      if (visited.has(current.summaryId)) continue;
+      visited.add(current.summaryId);
+      const sourceIds = await this.summaryStore.getSummaryMessages(current.summaryId);
+      if (current.kind === "leaf" && sourceIds.length === 0) return false;
+      // Inspect every direct source, including any links on condensed records.
+      // A user, missing row, or source before the boundary invalidates the proof.
+      for (const id of sourceIds) {
+        const source = await this.conversationStore.getMessageById(id);
+        if (!source || source.conversationId !== summary.conversationId ||
+            source.seq <= userSeq || (source.role !== "assistant" && source.role !== "tool")) return false;
+        hasAssistant ||= source.role === "assistant";
+        hasTool ||= source.role === "tool";
+      }
+      if (current.kind === "condensed") {
+        const parents = await this.summaryStore.getSummaryParents(current.summaryId);
+        // Strictly descending depth also rejects cycles without unbounded traversal.
+        if (parents.length === 0 || parents.some((parent) =>
+          parent.conversationId !== summary.conversationId || parent.depth >= current.depth)) return false;
+        pending.push(...parents);
+      }
+    }
+    return hasAssistant && hasTool;
+  }
+
+  /** Keep proven tool-history summaries from creating a synthetic current-user boundary. */
   private async preserveCurrentUserBoundary(items: ResolvedItem[]): Promise<void> {
     const user = items.findLast((item) => item.isMessage && item.sourceRole === "user");
-    if (!user) return;
+    if (user?.seq === undefined) return;
     for (const item of items) {
-      if (!item.summary || item.summary.kind !== "leaf" || item.ordinal <= user.ordinal) continue;
-      const sourceIds = await this.summaryStore.getSummaryMessages(item.summary.summaryId);
-      const sources = await Promise.all(sourceIds.map((id) => this.conversationStore.getMessageById(id)));
-      // Only proven assistant/tool history can use this representation. Prefix
-      // summaries retain their user role, including the first-message guarantee.
-      if (!sources.some((source) => source?.role === "assistant") ||
-          !sources.some((source) => source?.role === "tool") ||
-          sources.some((source) => !source ||
-            (source.role !== "assistant" && source.role !== "tool"))) continue;
+      if (!item.summary || item.ordinal <= user.ordinal) continue;
+      // Prefix summaries retain their user role, including the first-message guarantee.
+      if (!await this.isCurrentTurnToolSummary(item.summary, user.seq)) continue;
       item.message = {
         role: "assistant",
         content: [{ type: "text", text: String(item.message.content) }],

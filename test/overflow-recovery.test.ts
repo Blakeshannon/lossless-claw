@@ -280,59 +280,82 @@ describe("authoritative forced overflow recovery", () => {
     expect(complete).not.toHaveBeenCalled();
   });
 
-  it("keeps ordinary historical mixed-tool summaries in their existing user role", async () => {
-    const engine = createEngineWithDeps(config);
-    const messages = [
-      ...transcript(1).map((entry) => entry.message),
-      {
+  it.each([0, 1, 2])(
+    "keeps ordinary historical mixed-tool summaries in their existing user role (depth=%i)",
+    async (depth) => {
+      const engine = createEngineWithDeps(config);
+      const messages = [
+        ...transcript(1).map((entry) => entry.message),
+        {
+          role: "user",
+          content: "Now review the deployment plan.",
+        } as AgentMessage,
+      ];
+      for (const message of messages)
+        await engine.ingest({ sessionId, sessionKey, message });
+      const store = engine.getConversationStore();
+      const summaries = engine.getSummaryStore();
+      const conversation = await store.getConversationForSession({
+        sessionId,
+        sessionKey,
+      });
+      const conversationId = conversation!.conversationId;
+      const rows = await store.getMessages(conversationId);
+      // Existing historical leaf provenance contains both assistant and tool rows,
+      // but precedes the current user and must retain normal prefix rendering.
+      await summaries.insertSummary({
+        summaryId: "historical-tool-leaf",
+        conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Historical file evidence.",
+        tokenCount: 8,
+      });
+      await summaries.linkSummaryToMessages(
+        "historical-tool-leaf",
+        rows.slice(1, 3).map((row) => row.messageId)
+      );
+      await summaries.replaceContextRangeWithSummary({
+        conversationId,
+        startOrdinal: 1,
+        endOrdinal: 2,
+        summaryId: "historical-tool-leaf",
+      });
+      let previousId = "historical-tool-leaf";
+      for (let level = 1; level <= depth; level++) {
+        const summaryId = `historical-tool-depth-${level}`;
+        await summaries.insertSummary({
+          summaryId,
+          conversationId,
+          kind: "condensed",
+          depth: level,
+          content: "Historical file evidence.",
+          tokenCount: 8,
+        });
+        await summaries.linkSummaryToParents(summaryId, [previousId]);
+        await summaries.replaceContextRangeWithSummary({
+          conversationId,
+          startOrdinal: 1,
+          endOrdinal: 1,
+          summaryId,
+        });
+        previousId = summaryId;
+      }
+      const assembled = await new ContextAssembler(store, summaries).assemble({
+        conversationId,
+        tokenBudget: 8000,
+        freshTailCount: 4,
+      });
+      const summary = assembled.messages.find((message) =>
+        JSON.stringify(message.content).includes("Historical file evidence.")
+      );
+      expect(summary?.role).toBe("user");
+      expect(assembled.messages.at(-1)).toMatchObject({
         role: "user",
         content: "Now review the deployment plan.",
-      } as AgentMessage,
-    ];
-    for (const message of messages)
-      await engine.ingest({ sessionId, sessionKey, message });
-    const store = engine.getConversationStore();
-    const summaries = engine.getSummaryStore();
-    const conversation = await store.getConversationForSession({
-      sessionId,
-      sessionKey,
-    });
-    const conversationId = conversation!.conversationId;
-    const rows = await store.getMessages(conversationId);
-    // Existing historical leaf provenance contains both assistant and tool rows,
-    // but precedes the current user and must retain normal prefix rendering.
-    await summaries.insertSummary({
-      summaryId: "historical-tool-leaf",
-      conversationId,
-      kind: "leaf",
-      depth: 0,
-      content: "Historical file evidence.",
-      tokenCount: 8,
-    });
-    await summaries.linkSummaryToMessages(
-      "historical-tool-leaf",
-      rows.slice(1, 3).map((row) => row.messageId)
-    );
-    await summaries.replaceContextRangeWithSummary({
-      conversationId,
-      startOrdinal: 1,
-      endOrdinal: 2,
-      summaryId: "historical-tool-leaf",
-    });
-    const assembled = await new ContextAssembler(store, summaries).assemble({
-      conversationId,
-      tokenBudget: 8000,
-      freshTailCount: 4,
-    });
-    const summary = assembled.messages.find((message) =>
-      JSON.stringify(message.content).includes("Historical file evidence.")
-    );
-    expect(summary?.role).toBe("user");
-    expect(assembled.messages.at(-1)).toMatchObject({
-      role: "user",
-      content: "Now review the deployment plan.",
-    });
-  });
+      });
+    }
+  );
 
   it("imports more than the normal reconciliation cap without truncating the initiating user", async () => {
     const entries = transcript(30);
@@ -536,3 +559,227 @@ describe("authoritative forced overflow recovery", () => {
     ).toBeNull();
   });
 });
+
+it.each([1, 2])(
+  "preserves the initiating user through nested recovery condensation (prefix depth=%i)",
+  async (prefixDepth) => {
+    const entries = transcript(20);
+    const complete = vi.fn(async () => ({
+      content: [{ type: "text", text: "Evidence ".repeat(140) }],
+    }));
+    const engine = createEngineWithDeps(
+      {
+        ...config,
+        freshTailCount: 0,
+        summaryPrefixTargetTokens: 1,
+        // Two forced cycles share one finite spend window in this fixture.
+        summaryMaxCallsPerWindow: 100,
+        leafMinFanout: 2,
+        condensedMinFanoutHard: 2,
+        condensedTargetTokens: 100,
+        leafChunkTokens: 2000,
+      },
+      {
+        complete,
+        readVisibleSessionTranscriptMessageEntries: async () => entries,
+      }
+    );
+    const store = engine.getConversationStore(),
+      summaries = engine.getSummaryStore();
+    for (const message of [
+      { role: "user", content: "A historical question." },
+      { role: "assistant", content: "A historical answer." },
+      { role: "user", content: "Another historical question." },
+      { role: "assistant", content: "Another historical answer." },
+    ])
+      await engine.ingest({
+        sessionId,
+        sessionKey,
+        message: message as AgentMessage,
+      });
+    const conv = (await store.getConversationForSession({
+      sessionId,
+      sessionKey,
+    }))!;
+    const historical = await store.getMessages(conv.conversationId);
+    for (let i = 0; i < 2; i++) {
+      await summaries.insertSummary({
+        summaryId: `historical-${i}`,
+        conversationId: conv.conversationId,
+        kind: "leaf",
+        depth: 0,
+        content: "Historical evidence.",
+        tokenCount: 20,
+      });
+      await summaries.linkSummaryToMessages(
+        `historical-${i}`,
+        historical.slice(i * 2, i * 2 + 2).map((m) => m.messageId)
+      );
+    }
+    await summaries.insertSummary({
+      summaryId: "prefix",
+      conversationId: conv.conversationId,
+      kind: "condensed",
+      depth: 1,
+      content: "Historical evidence ".repeat(100),
+      tokenCount: 400,
+    });
+    await summaries.linkSummaryToParents("prefix", [
+      "historical-0",
+      "historical-1",
+    ]);
+    await summaries.replaceContextRangeWithSummary({
+      conversationId: conv.conversationId,
+      startOrdinal: 0,
+      endOrdinal: 3,
+      summaryId: "prefix",
+    });
+    if (prefixDepth === 2) {
+      await summaries.insertSummary({
+        summaryId: "nested-prefix",
+        conversationId: conv.conversationId,
+        kind: "condensed",
+        depth: 2,
+        content: "Historical evidence ".repeat(100),
+        tokenCount: 400,
+      });
+      await summaries.linkSummaryToParents("nested-prefix", ["prefix"]);
+      await summaries.replaceContextRangeWithSummary({
+        conversationId: conv.conversationId,
+        startOrdinal: 0,
+        endOrdinal: 0,
+        summaryId: "nested-prefix",
+      });
+    }
+    // Existing old prefix has no projection identity, so explicitly ingest the shared anchor.
+    await engine.ingest({
+      sessionId,
+      sessionKey,
+      message: attachTranscriptEntryMeta(entries[0]!.message, {
+        entryId: entries[0]!.entryId,
+        parentId: null,
+        timestamp: null,
+      }),
+    });
+    for (const pairs of [20, 40]) {
+      // Extend the same host turn, forcing a second real condensation cycle.
+      const next = transcript(pairs);
+      entries.push(...next.slice(entries.length));
+      const result = await engine.compact({
+        sessionId,
+        sessionKey,
+        sessionTarget,
+        sessionFile: "",
+        tokenBudget: 8000,
+        force: true,
+        compactionTarget: "budget",
+        runtimeSettings,
+      });
+      expect(result.compacted).toBe(true);
+      const ctx = await summaries.getContextItems(conv.conversationId);
+      const records = await Promise.all(
+        ctx
+          .filter((item) => item.summaryId)
+          .map((item) => summaries.getSummary(item.summaryId!))
+      );
+      expect(
+        records.some(
+          (record) =>
+            record?.summaryId !== "prefix" &&
+            record?.summaryId !== "nested-prefix" &&
+            record?.kind === "condensed" &&
+            record.depth >= prefixDepth
+        )
+      ).toBe(true);
+      const assembled = await engine.assemble({
+        sessionId,
+        sessionKey,
+        messages: entries.map((e) => e.message),
+        tokenBudget: 8000,
+        runtimeSettings,
+      });
+      expect(
+        assembled.messages.findLast((m) => m.role === "user")?.content
+      ).toBe(entries[0]!.message.content);
+      expect(assembled.messages[0]?.role).toBe("user");
+      expect(JSON.stringify(assembled.messages[0]?.content)).toContain(
+        "Historical evidence"
+      );
+      const userIndex = assembled.messages.findIndex(
+        (m) => m.role === "user" && m.content === entries[0]!.message.content
+      );
+      expect(userIndex).toBeGreaterThan(0);
+      expect(
+        assembled.messages.slice(userIndex + 1).some((m) => m.role === "user")
+      ).toBe(false);
+      const unclamped = await new ContextAssembler(store, summaries).assemble({
+        conversationId: conv.conversationId,
+        tokenBudget: 8000,
+        freshTailCount: 0,
+        freshTailMaxTokens: 2500,
+      });
+      expect(assembled.messages).toEqual(unclamped.messages);
+      expect(estimateSerializedMessagesTokens(assembled.messages)).toBeLessThan(
+        8000
+      );
+
+      // Commit the authoritative rows after recovery, then reassemble with stable identities.
+      const before = await store.getMessages(conv.conversationId);
+      const last = entries.at(-1)!;
+      const commit = {
+        sessionId,
+        sessionKey,
+        sessionTarget,
+        advancementKey: `condensed-${pairs}`,
+        admission: {
+          ...sessionTarget,
+          entryId: entries[0]!.entryId,
+          effectiveParentId: null,
+          generation: "g1",
+          logicalTurnId: `condensed-${pairs}`,
+          rawSeq: 1,
+          activeMessagePosition: 0,
+          role: "user" as const,
+        },
+        terminal: {
+          ...sessionTarget,
+          entryId: last.entryId,
+          effectiveParentId: last.parentId,
+          generation: "g1",
+          rawSeq: entries.length,
+          activeMessagePosition: entries.length - 1,
+        },
+        messages: entries.map((entry) =>
+          attachTranscriptEntryMeta(entry.message, {
+            entryId: entry.entryId,
+            parentId: entry.parentId,
+            timestamp: entry.createdAt ?? null,
+          })
+        ),
+      };
+      await expect(engine.commitTurn(commit)).resolves.toEqual({
+        status: "committed",
+      });
+      await expect(engine.commitTurn(commit)).resolves.toEqual({
+        status: "duplicate",
+      });
+      const after = await store.getMessages(conv.conversationId);
+      expect(
+        after.map((row) => [row.messageId, row.transcriptEntryId, row.content])
+      ).toEqual(
+        before.map((row) => [row.messageId, row.transcriptEntryId, row.content])
+      );
+      expect(after.filter((row) => row.transcriptEntryId)).toHaveLength(
+        entries.length
+      );
+      const repeated = await engine.assemble({
+        sessionId,
+        sessionKey,
+        messages: entries.map((e) => e.message),
+        tokenBudget: 8000,
+        runtimeSettings,
+      });
+      expect(repeated.messages).toEqual(assembled.messages);
+    }
+  }
+);
