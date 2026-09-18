@@ -88,7 +88,7 @@ export function mount(container: HTMLElement, initial: Context) {
     const card = el("details", "", nested ? "lcm-explorer__card lcm-explorer__branch" : "lcm-explorer__card"); card.dataset.summaryId = summary.summaryId;
     const top = el("summary");
     const labels = el("div", "", "lcm-explorer__row");
-    labels.append(el("span", summary.kind === "leaf" ? "Conversation" : "Overview", "lcm-explorer__kind"),
+    labels.append(el("span", `D${summary.depth}`, "lcm-explorer__kind"),
       el("span", summary.tokenCount == null ? "" : `${tokens(summary.tokenCount)} tokens`, "lcm-explorer__tokens"));
     const relativeAge = el("time", "", "lcm-explorer__age");
     relativeAge.dataset.timestamp = summary.latestAt || summary.createdAt || "";
@@ -354,6 +354,10 @@ export function mount(container: HTMLElement, initial: Context) {
   const actions = el("div", "", "lcm-explorer__dialog-actions"); actions.append(cancel, confirm);
   dialog.append(dialogHeading, dialogText, offline, dialogStatus, actions); root.append(dialog);
   let plan: ExplorerRepairPlan | undefined, dialogGeneration = 0;
+  const setRepairBusy = (busy: boolean) => {
+    confirm.setAttribute("aria-busy", String(busy));
+    confirm.textContent = busy ? "Repairing…" : "Repair";
+  };
   const updateConfirm = () => { confirm.disabled = !plan || !plan.count || repairing || (plan.requiresOffline && !offlineCheck.checked); };
   offlineCheck.onchange = updateConfirm;
   cancel.onclick = () => dialog.close();
@@ -363,7 +367,7 @@ export function mount(container: HTMLElement, initial: Context) {
     const epoch = generation, revision = ++dialogGeneration;
     plan = undefined; confirm.hidden = false; offline.hidden = true; offlineCheck.checked = false;
     dialogStatus.textContent = ""; dialogText.textContent = "Checking repair scope…"; confirm.disabled = true;
-    cancel.disabled = false; cancel.textContent = "Cancel"; confirm.textContent = "Repair";
+    cancel.disabled = false; cancel.textContent = "Cancel"; setRepairBusy(false);
     dialog.showModal(); cancel.focus();
     try {
       const preview = await request<ExplorerRepairPlan>({ mode: "preview" }, "context-explorer-repair");
@@ -382,7 +386,7 @@ export function mount(container: HTMLElement, initial: Context) {
   confirm.onclick = async () => {
     if (!plan || confirm.disabled) return;
     const epoch = generation;
-    repairing = true; confirm.disabled = cancel.disabled = offlineCheck.disabled = true;
+    repairing = true; setRepairBusy(true); confirm.disabled = cancel.disabled = offlineCheck.disabled = true;
     check.disabled = repair.disabled = true; dialogStatus.textContent = "Repairing… This can take a few minutes.";
     try {
       const result = await request<ExplorerRepairResult>({ mode: "apply", token: plan.token, confirm: true,
@@ -399,7 +403,7 @@ export function mount(container: HTMLElement, initial: Context) {
       if (alive(epoch)) { dialogStatus.textContent = error instanceof Error ? error.message : "Repair failed. Try again."; plan = undefined; }
     } finally {
       if (alive(epoch)) {
-        repairing = false; cancel.disabled = offlineCheck.disabled = check.disabled = repair.disabled = false;
+        repairing = false; setRepairBusy(false); cancel.disabled = offlineCheck.disabled = check.disabled = repair.disabled = false;
         cancel.textContent = "Close"; confirm.disabled = true; void reload();
       }
     }
@@ -415,7 +419,7 @@ export function mount(container: HTMLElement, initial: Context) {
     update(next: Context) {
       const changed = next.props.sessionKey !== context.props.sessionKey || next.props.agentId !== context.props.agentId;
       context = next;
-      if (changed) { for (const observer of previewObservers.keys()) observer.disconnect(); previewObservers.clear(); generation++; checking = false; repairing = false; dialog.close(); earlier.replaceChildren(); repair.hidden = true; repair.disabled = false; offlineCheck.disabled = false; report.textContent = ""; report.title = ""; check.disabled = true; lastSignature = ""; nextOffset = null; list.replaceChildren(); overview.replaceChildren(); stats.replaceChildren(); tail.textContent = ""; more.hidden = true; status.textContent = "Loading context…"; }
+      if (changed) { for (const observer of previewObservers.keys()) observer.disconnect(); previewObservers.clear(); generation++; checking = false; repairing = false; setRepairBusy(false); dialog.close(); earlier.replaceChildren(); repair.hidden = true; repair.disabled = false; offlineCheck.disabled = false; report.textContent = ""; report.title = ""; check.disabled = true; lastSignature = ""; nextOffset = null; list.replaceChildren(); overview.replaceChildren(); stats.replaceChildren(); tail.textContent = ""; more.hidden = true; status.textContent = "Loading context…"; }
       void reload();
     },
     dispose,

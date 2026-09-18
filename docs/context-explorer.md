@@ -2,8 +2,9 @@
 
 The **Context explorer** session panel shows the summaries retained in this
 session's active Lossless context, in assembly order. It includes readable summary previews, covered dates, stored token estimates,
-expandable Markdown, and recursive source-summary drill-down. “Conversation”
-summaries summarize messages; “Overview” summaries combine earlier summaries.
+expandable Markdown, and recursive source-summary drill-down. `D0`
+summaries summarize messages; `D1` and higher combine earlier summaries at the
+indicated depth.
 Internal summary IDs are not shown, and message counts appear only on leaves. Recent messages
 are counted separately; their text is not loaded by the panel.
 
@@ -65,7 +66,9 @@ selected active conversation, not archived conversations or other sessions.
 It is read-only and is not the full `/lcm doctor` health report.
 
 **Repair…** opens a theme-aware modal with the exact number of flagged summaries
-in the conversation to rebuild. Cancel and Escape do not run repairs. Confirmation
+in the conversation to rebuild. Cancel and Escape do not run repairs. While repair is running, the disabled
+Repair button shows a spinner and “Repairing…” label; reduced-motion preferences
+are respected. Confirmation
 uses the configured summarizer and doctor’s backup-first repair path. A separate
 `operator.write` action enforces the same count/input-size/maintenance preflight
 as doctor. If offline maintenance is required, the modal explains why and requires

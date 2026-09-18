@@ -90,3 +90,8 @@
 .lcm-explorer__offline input { margin-top: 4px; accent-color: var(--accent, auto); }
 .lcm-explorer__dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
 .lcm-explorer__primary { background: var(--accent, Highlight); color: var(--accent-foreground, HighlightText); border-color: transparent; }
+
+.lcm-explorer__primary[aria-busy="true"] { display: inline-flex; align-items: center; gap: 6px; }
+.lcm-explorer__primary[aria-busy="true"]::before { content: ""; width: 12px; height: 12px; border: 2px solid currentColor; border-right-color: transparent; border-radius: 50%; animation: lcm-repair-spin .8s linear infinite; }
+@keyframes lcm-repair-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .lcm-explorer__primary[aria-busy="true"]::before { animation: none; } }
