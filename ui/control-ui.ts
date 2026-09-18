@@ -44,10 +44,8 @@ export function mount(container: HTMLElement, initial: Context) {
   const list = el("div", "", "lcm-explorer__list");
   const more = el("button", "Load more summaries", "lcm-explorer__button"); more.type = "button"; more.hidden = true;
   const tail = el("p", "", "lcm-explorer__tail");
-  const note = el("p", "Stored context · token estimates", "lcm-explorer__note");
-  note.title = "Summaries retained for assembly, not a recording of the last prompt. Budgeting, focus, and runtime projection can change what reaches the model.";
   header.append(status);
-  root.append(header, stats, list, more, tail, note); container.append(root);
+  root.append(header, stats, list, more, tail); container.append(root);
 
   function alive(epoch: number) { return !disposed && !context.signal.aborted && epoch === generation; }
   async function request<T>(payload: Record<string, unknown>): Promise<T> {
@@ -181,7 +179,7 @@ export function mount(container: HTMLElement, initial: Context) {
       status.title = `Automatically checked ${new Date(snapshot.capturedAt).toLocaleTimeString()}`;
       status.textContent = snapshot.conversationId === null ? "Lossless has not recorded context for this session yet." :
         snapshot.summaryCount === 0 ? "No summaries yet. This session is still using recent messages." :
-        "Live";
+        "";
     } catch {
       if (alive(epoch)) status.textContent = "Temporarily unavailable · retrying automatically.";
     } finally {

@@ -29,4 +29,3 @@
 .lcm-explorer__button:disabled { opacity: .5; cursor: default; }
 .lcm-explorer > .lcm-explorer__button { margin-top: 8px; }
 .lcm-explorer__tail { color: var(--muted, #93a4ae); font-size: 11px; margin: 9px 0 3px; }
-.lcm-explorer__note { color: var(--muted, #93a4ae); font-size: 10px; margin: 0; opacity: .8; }

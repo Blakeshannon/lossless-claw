@@ -90,7 +90,7 @@ try {
   assert.equal(await page.locator(".lcm-explorer__card").count(), 3);
   await page.evaluate(() => { window.fail = false; });
   await page.clock.runFor(10000);
-  await page.waitForFunction(() => document.querySelector('[role="status"]').textContent === "Live");
+  await page.waitForFunction(() => document.querySelector('[role="status"]').textContent === "");
   await page.evaluate(() => { window.view.update({ ...window.ctx, presented: false }); });
   const pausedCalls = await page.evaluate(() => window.calls.length);
   await page.clock.runFor(20000);
