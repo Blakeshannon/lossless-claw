@@ -5,6 +5,7 @@
  * full-text search, and sub-agent expansion.
  */
 import { join } from "node:path";
+import { registerContextExplorer } from "../context-explorer.js";
 import { writeFile } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
 import type {
@@ -37,7 +38,7 @@ import type {
 } from "../types.js";
 import { listConfiguredAgentIds, normalizeAgentId } from "./openclaw-agent-ids.js";
 
-const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.7.2-beta.2";
+const MIN_CONTEXT_ENGINE_OPENCLAW_VERSION = "2026.9.2";
 
 type PluginSdkCoreModule = {
   delegateCompactionToRuntime?: RuntimeCompactionDelegateFn;
@@ -1502,6 +1503,7 @@ function wirePluginHandlers(
   shared: SharedLcmInit,
   openClawConfig?: unknown,
 ): void {
+  registerContextExplorer(api, shared.waitForDatabase);
   api.on("before_reset", async (event, ctx) => {
     await (await shared.waitForEngine()).handleBeforeReset({
       reason: event.reason,

@@ -1,5 +1,9 @@
 {
   "id": "lossless-claw",
+  "controlUi": {
+    "entry": "dist/control-ui/index.js",
+    "styles": ["dist/control-ui/index.css"]
+  },
   "name": "Lossless Context Management",
   "kind": "context-engine",
   "activation": {
