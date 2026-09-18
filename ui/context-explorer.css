@@ -80,3 +80,13 @@
 .lcm-explorer__warning-badge { color: var(--warn, var(--text, CanvasText)); font-size: 10px; font-weight: 500; }
 .lcm-explorer__warning { color: var(--warn, var(--text, CanvasText)); background: var(--warn-subtle, transparent); border-left: 2px solid currentColor; padding: 6px 8px; margin: 4px 0 8px; font-size: 11px; }
 .lcm-explorer__row { flex-wrap: wrap; gap: 3px 8px; }
+
+.lcm-explorer__health > button + button { margin-left: 6px; }
+.lcm-explorer__dialog { width: min(440px, calc(100vw - 32px)); max-height: calc(100vh - 48px); overflow: auto; padding: 22px; border: 1px solid var(--border, GrayText); border-radius: 12px; background: var(--card, Canvas); color: var(--text, CanvasText); box-shadow: 0 24px 80px #0006; font: 13px/1.5 var(--font-body, system-ui, sans-serif); }
+.lcm-explorer__dialog::backdrop { background: #0007; }
+.lcm-explorer__dialog h2 { font-size: 16px; margin: 0 0 10px; color: var(--text-strong, var(--text)); }
+.lcm-explorer__dialog p { margin: 8px 0 14px; }
+.lcm-explorer__offline:not([hidden]) { display: flex; gap: 9px; align-items: flex-start; padding: 12px; border-radius: 6px; background: var(--warn-subtle, transparent); }
+.lcm-explorer__offline input { margin-top: 4px; accent-color: var(--accent, auto); }
+.lcm-explorer__dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 20px; }
+.lcm-explorer__primary { background: var(--accent, Highlight); color: var(--accent-foreground, HighlightText); border-color: transparent; }

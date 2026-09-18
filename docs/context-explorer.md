@@ -31,8 +31,9 @@ same preview/full-text controls. Descendants load only when opened.
 Colors, accents, focus outlines, and the UI font follow the selected OpenClaw
 theme automatically, including theme changes while the panel is open.
 It uses the authenticated session-action transport with `operator.read`, passing
-both the panel's session key and agent identity. It makes no model calls, sends
-no data to external services, and performs no database mutations.
+both the panel's session key and agent identity. Browsing and checking summaries
+make no model calls and perform no database mutations. Repairs use a separate
+write-scoped action and require explicit confirmation.
 
 If you cannot upgrade OpenClaw, retain your earlier compatible Lossless release
 and use the `lcm-tui` Context View instead. Custom UI being disabled does not
@@ -48,24 +49,38 @@ context tokens, rounded to an integer and shown as `1:N` (minimum `1:1`). It is
 omitted when either side is zero. The tooltip explains this accounting; it is
 not raw conversation/context division, a savings percentage, or a billing claim.
 No model calls are made to generate the source-summary titles: these are excerpts
-from the existing summary text.
+from the existing summary text. The subtle footer shows the installed Lossless
+version and SQLite database size (page count × page size; excludes WAL/SHM files).
 
 ## Summary quality
 
 Fallback, shortened (truncated), and emergency summaries carry a warning badge,
-including nested source summaries. Opening one explains that the summary may
-omit detail while original messages remain in history. Detection shares doctor’s
-full-content and model-marker logic; it is not inferred from the short preview.
-An unmarked summary is not a guarantee of completeness or accuracy.
+including nested source summaries. Opening one explains that it may omit detail.
+Detection shares doctor’s full-content and model-marker logic; it is not inferred
+from the short preview. An unmarked summary is not a guarantee of accuracy.
 
-**Check summaries** runs the read-only summary-quality portion of doctor for the
-selected active conversation, including stored summaries outside its active
-context. It reports fallback, truncation, and emergency counts inline. It is not
-a full `/lcm doctor` health report and never calls a model or rewrites a summary.
-For the complete report and repair guidance, run `/lcm doctor` in that session.
-The existing repair command is conversation-scoped and has safety preflights;
-the explorer does not offer a misleading single-summary repair button or bypass
-those checks.
+**Check summaries** opens affected branches. Flagged summaries outside the
+visible tree appear expanded under **Earlier summaries**. The check covers the
+selected active conversation, not archived conversations or other sessions.
+It is read-only and is not the full `/lcm doctor` health report.
+
+**Repair…** opens a theme-aware modal with the exact number of flagged summaries
+in the conversation to rebuild. Cancel and Escape do not run repairs. Confirmation
+uses the configured summarizer and doctor’s backup-first repair path. A separate
+`operator.write` action enforces the same count/input-size/maintenance preflight
+as doctor. If offline maintenance is required, the modal explains why and requires
+an unchecked acknowledgement that active delivery has been paused or moved away
+from this conversation—the equivalent of `confirm-offline`. This does not itself
+pause channels or guarantee inactivity.
+
+Repair previews expire after five minutes and are bound to the browser connection,
+session, conversation, targets, and source contents. The server rechecks scope and
+preflight at confirmation, rejects concurrent repairs through this surface, and
+checks target/source changes again before committing. Retries of a completed
+confirmation return its previous result for five minutes. Repaired, unchanged,
+and skipped counts are shown; failed/skipped work leaves originals unchanged.
+Emergency model markers are cleared after a successful rewrite. Original messages
+are never changed by this repair action.
 
 ## What “active context” means
 
@@ -99,8 +114,23 @@ Returns `basis: "stored-active-context"`, snapshot time, conversation id, summar
 and message counts/tokens, up to 50 summaries, and a nullable `nextOffset`.
 Use `{ "summaryId": "sum_...", "offset": 0 }` for summary text (24,000-character
 pages), directly linked source-message count, and up to 100 child summaries.
-Use `{ "check": true }` for conversation-scoped summary-quality counts.
+Use `{ "check": true, "offset": 0 }` for conversation-scoped quality counts,
+up to 50 flagged summary previews, their ancestor IDs, and a nullable `nextOffset`.
+Snapshots also include `version` and `databaseBytes` (never the database path).
 Detail reads enforce the same active-conversation boundary. The browser renders
 Markdown through Marked and a restricted DOMPurify allowlist. Embedded images,
 active HTML, styles, and unsafe links are not rendered. No database path, credentials, or provider
 access is exposed to the browser.
+
+## Repair API
+
+The separate `context-explorer-repair` session action requires `operator.write`:
+
+- `{ "mode": "preview" }` returns `token`, `count`, `requiresOffline`, and `reasons`.
+- `{ "mode": "apply", "token": "…", "confirm": true, "confirmOffline": false }`
+  awaits the repair and returns `repaired`, `unchanged`, and `skipped` counts.
+  `confirmOffline` must be explicitly true when the preflight requires it.
+
+Only the opaque confirmation token crosses the browser boundary; source content,
+backup paths, and provider credentials remain server-side. This is conversation-wide
+repair of the previewed flagged summaries, not an arbitrary single-node edit.

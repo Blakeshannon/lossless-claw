@@ -30,7 +30,7 @@ try {
     const plugin = (await import("/index.js")).default;
     const snapshot = {
       basis: "stored-active-context", capturedAt: new Date().toISOString(), conversationId: 1,
-      conversationTokens: 276000, compressedTokens: 250000, compressionRatio: 7,
+      version: "1.0.0", databaseBytes: 750780416, conversationTokens: 276000, compressedTokens: 250000, compressionRatio: 7,
       summaryCount: 3, messageCount: 24, summaryTokens: 12420, messageTokens: 26000, nextOffset: null,
       summaries: [
         { summaryId: "sum_a83d2b", ordinal: 0, kind: "condensed", depth: 2, tokenCount: 6840,
@@ -50,7 +50,15 @@ try {
         if (window.fail) throw new Error("Network unavailable");
         if (window.delay) await new Promise(done => { window.release = done; });
         if (params.sessionKey === "agent:other:empty") return { ok: true, result: { ...snapshot, conversationId: null, summaryCount: 0, summaries: [] } };
-        if (params.payload.check) return { ok: true, result: { checkedAt: new Date().toISOString(), total: 2, fallback: 0, truncated: 1, emergency: 1 } };
+        if (params.actionId === "context-explorer-repair") {
+          if (params.payload.mode === "preview") return { ok: true, result: {
+            token: "reviewed-token", count: 2, requiresOffline: window.offlineRequired ?? true,
+            reasons: ["compaction maintenance is pending"] } };
+          window.repairs = (window.repairs ?? 0) + 1;
+          return { ok: true, result: { repaired: 2, unchanged: 0, skipped: 0 } };
+        }
+        if (params.payload.check) return { ok: true, result: { checkedAt: new Date().toISOString(), total: 2, fallback: 0, truncated: 1, emergency: 1,
+          summaries: [snapshot.summaries[1]], revealIds: ["sum_a83d2b", "sum_child", "sum_grandchild", snapshot.summaries[1].summaryId], nextOffset: null } };
         if (params.payload.summaryId) return { ok: true, result: { summaryId: params.payload.summaryId,
           content: params.payload.offset ? "\n\n## Final page\nLast paragraph." : window.summaryText,
           nextOffset: params.payload.offset ? null : 24000, sourceMessages: 12,
@@ -117,10 +125,25 @@ try {
   await page.screenshot({ path: resolve(output, "context-explorer-polished.png"), fullPage: true });
   assert.match(await page.locator('.lcm-explorer__list > .lcm-explorer__card').nth(1).locator('.lcm-explorer__warning-badge').textContent(), /Shortened summary/);
   assert.match(await page.locator('[data-summary-id="sum_grandchild"] > summary .lcm-explorer__warning-badge').textContent(), /Emergency summary/);
-  assert.match(await page.locator('[data-summary-id="sum_grandchild"] > .lcm-explorer__body > .lcm-explorer__warning').textContent(), /original messages/);
+  assert.match(await page.locator('[data-summary-id="sum_grandchild"] > .lcm-explorer__body > .lcm-explorer__warning').textContent(), /may omit detail/);
   await page.getByRole("button", { name: "Check summaries", exact: true }).click();
-  await page.waitForFunction(() => document.querySelector('.lcm-explorer__health-report').textContent.includes('2 summaries need attention'));
+  await page.waitForFunction(() => document.querySelector('.lcm-explorer__health-report').textContent.includes('2 to repair'));
   assert.equal(await page.evaluate(() => window.calls.filter(call => call.payload.check === true).length), 1);
+  assert.equal(await page.getByRole("button", { name: "Check summaries", exact: true }).getAttribute("title"), null);
+  assert.match(await page.locator('.lcm-explorer__tail').textContent(), /Lossless v1.0.0 · 716.0 MB/);
+  assert.equal(await page.locator('[data-summary-id="sum_grandchild"]').evaluate(node => node.open), true);
+  await page.getByRole("button", { name: "Repair…", exact: true }).click();
+  await page.getByRole("heading", { name: "Repair 2 summaries?" }).waitFor();
+  assert(await page.getByRole("button", { name: "Repair", exact: true }).isDisabled());
+  await page.screenshot({ path: resolve(output, "context-explorer-repair-offline.png"), fullPage: true });
+  await page.getByRole("button", { name: "Cancel", exact: true }).click();
+  assert.equal(await page.evaluate(() => window.repairs ?? 0), 0, "cancel never repairs");
+  await page.evaluate(() => { window.offlineRequired = false; });
+  await page.getByRole("button", { name: "Repair…", exact: true }).click();
+  await page.waitForFunction(() => !document.querySelector('.lcm-explorer__primary').disabled);
+  assert(await page.locator('.lcm-explorer__offline').isHidden());
+  await page.keyboard.press("Escape");
+  assert.equal(await page.evaluate(() => window.repairs ?? 0), 0, "Escape never repairs");
   await page.evaluate(() => { window.fail = true; });
   await page.getByRole("button", { name: "Check summaries", exact: true }).click();
   await page.waitForFunction(() => document.querySelector('.lcm-explorer__health-report').textContent.includes('Try again'));
@@ -132,8 +155,8 @@ try {
   await page.evaluate(() => { window.snapshot.messageCount++; });
   await page.clock.runFor(10000);
   await page.waitForFunction(() => document.querySelector(".lcm-explorer__stats").textContent.includes("25 recent"));
-  assert.equal(await page.locator(".lcm-explorer__list > .lcm-explorer__card[open]").count(), 1);
-  assert.equal(await page.locator(".lcm-explorer__content").count(), 3, "polling preserves expanded details");
+  assert.equal(await page.locator(".lcm-explorer__list > .lcm-explorer__card[open]").count(), 2);
+  assert.equal(await page.locator(".lcm-explorer__content").count(), 4, "polling preserves expanded details");
   await page.evaluate(() => { window.fail = true; });
   await page.clock.runFor(10000);
   await page.waitForFunction(() => document.querySelector('[role="status"]').textContent.includes("retrying"));
@@ -141,6 +164,17 @@ try {
   await page.evaluate(() => { window.fail = false; });
   await page.clock.runFor(10000);
   await page.waitForFunction(() => document.querySelector('[role="status"]').textContent === "");
+  await page.getByRole("button", { name: "Check summaries", exact: true }).click();
+  await page.getByRole("button", { name: "Repair…", exact: true }).waitFor();
+  await page.evaluate(() => { window.offlineRequired = true; });
+  await page.getByRole("button", { name: "Repair…", exact: true }).click();
+  await page.getByRole("heading", { name: "Repair 2 summaries?" }).waitFor();
+  await page.getByRole("checkbox").check();
+  await page.getByRole("button", { name: "Repair", exact: true }).click();
+  await page.getByRole("heading", { name: "Repair complete" }).waitFor();
+  assert.equal(await page.evaluate(() => window.repairs), 1);
+  assert.equal(await page.evaluate(() => window.calls.find(call => call.payload.mode === "apply").payload.confirmOffline), true);
+  await page.getByRole("button", { name: "Close", exact: true }).click();
   await page.evaluate(() => { window.view.update({ ...window.ctx, presented: false }); });
   const pausedCalls = await page.evaluate(() => window.calls.length);
   await page.clock.runFor(20000);

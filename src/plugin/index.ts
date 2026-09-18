@@ -5,6 +5,7 @@
  * full-text search, and sub-agent expansion.
  */
 import { join } from "node:path";
+import { registerContextExplorerRepair } from "../context-explorer-repair.js";
 import { registerContextExplorer } from "../context-explorer.js";
 import { writeFile } from "node:fs/promises";
 import type { DatabaseSync } from "node:sqlite";
@@ -1504,6 +1505,7 @@ function wirePluginHandlers(
   openClawConfig?: unknown,
 ): void {
   registerContextExplorer(api, shared.waitForDatabase);
+  registerContextExplorerRepair(api, shared.waitForDatabase, { config: deps.config, deps, runtimeConfig: openClawConfig });
   api.on("before_reset", async (event, ctx) => {
     await (await shared.waitForEngine()).handleBeforeReset({
       reason: event.reason,

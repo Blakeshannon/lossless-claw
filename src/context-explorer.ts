@@ -1,3 +1,4 @@
+import packageJson from "../package.json" with { type: "json" };
 import type { DatabaseSync } from "node:sqlite";
 import type { OpenClawPluginApi } from "./openclaw-bridge.js";
 import { detectDoctorMarkerForRow, getDoctorSummaryStats, type DoctorMarkerKind } from "./plugin/lcm-doctor-shared.js";
@@ -13,6 +14,7 @@ export type ExplorerSnapshot = {
   basis: "stored-active-context"; capturedAt: string; conversationId: number | null;
   summaryCount: number; messageCount: number; summaryTokens: number; messageTokens: number;
   conversationTokens: number; compressedTokens: number; compressionRatio: number | null;
+  version: string; databaseBytes: number;
   summaries: ExplorerSummary[]; nextOffset: number | null;
 };
 export type ExplorerDetail = {
@@ -23,6 +25,7 @@ export type ExplorerDetail = {
 
 export type ExplorerHealth = {
   checkedAt: string; total: number; fallback: number; truncated: number; emergency: number;
+  summaries: ExplorerSummary[]; revealIds: string[]; nextOffset: number | null;
 };
 
 type SummaryRow = Omit<ExplorerSummary, "quality"> & { content: string; model: string };
@@ -49,8 +52,24 @@ export function readContextExplorer(db: DatabaseSync, sessionKey: string, input:
   if (input.check === true) {
     if (!id) throw new Error("No active Lossless conversation for this session");
     const stats = getDoctorSummaryStats(db, id);
+    const ids = stats.candidates.slice(offset, offset + 50).map(c => c.summaryId);
+    const summaries = ids.map(summaryId => withQuality(db.prepare(`SELECT summary_id AS summaryId,
+      0 AS ordinal, kind, depth, content, model, token_count AS tokenCount, substr(content, 1, 220) AS preview,
+      earliest_at AS earliestAt, latest_at AS latestAt, created_at AS createdAt,
+      descendant_count AS descendantCount, source_message_token_count AS sourceMessageTokenCount
+      FROM summaries WHERE conversation_id = ? AND summary_id = ?`).get(id, summaryId) as SummaryRow));
+    const revealIds = new Set<string>();
+    for (const summaryId of ids) {
+      const ancestors = db.prepare(`WITH RECURSIVE ancestors(id) AS (
+        SELECT summary_id FROM summaries WHERE summary_id = ? AND conversation_id = ?
+        UNION SELECT p.summary_id FROM summary_parents p JOIN ancestors a ON p.parent_summary_id = a.id
+        JOIN summaries s ON s.summary_id = p.summary_id WHERE s.conversation_id = ?)
+        SELECT id FROM ancestors`).all(summaryId, id, id) as { id: string }[];
+      for (const ancestor of ancestors) revealIds.add(ancestor.id);
+    }
     return { checkedAt: new Date().toISOString(), total: stats.total,
-      fallback: stats.old + stats.fallback, truncated: stats.truncated, emergency: stats.emergency };
+      fallback: stats.old + stats.fallback, truncated: stats.truncated, emergency: stats.emergency,
+      summaries, revealIds: [...revealIds], nextOffset: offset + 50 < stats.total ? offset + 50 : null };
   }
   if (typeof input.summaryId === "string") {
     if (!id) throw new Error("No active Lossless conversation for this session");
@@ -75,6 +94,9 @@ export function readContextExplorer(db: DatabaseSync, sessionKey: string, input:
       sourceMessages: source.count, children: children.slice(0, 100).map(withQuality), childrenTruncated: children.length > 100 };
   }
   const empty: ExplorerSnapshot = { basis: "stored-active-context", capturedAt: new Date().toISOString(),
+    version: packageJson.version,
+    databaseBytes: (db.prepare("PRAGMA page_count").get() as { page_count: number }).page_count
+      * (db.prepare("PRAGMA page_size").get() as { page_size: number }).page_size,
     conversationId: id ?? null, summaryCount: 0, messageCount: 0, summaryTokens: 0,
     messageTokens: 0, conversationTokens: 0, compressedTokens: 0, compressionRatio: null, summaries: [], nextOffset: null };
   if (!id) return empty;
