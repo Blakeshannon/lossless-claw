@@ -1,0 +1,13 @@
+Implemented and committed three milestones on `agent/async-db-worker-offload`:
+
+- `d823e8e feat: add async database worker client`
+- `77f8a74 feat: route async db transactions through worker`
+- `c0048ff feat: track async db worker connections`
+
+Handoff written at [/tmp/lossless-claw-fork/HANDOFF-async-db-worker.md](/tmp/lossless-claw-fork/HANDOFF-async-db-worker.md).
+
+Important: this is not a full contract-complete implementation. The worker/client, async lifecycle helpers, transaction routing, and regression test are in place, but the 28 call-site migration and plugin switch from `DatabaseSync` to the async worker connection are not completed. I documented that deviation in the handoff.
+
+The worktree is clean.
+
+RESULT: typecheck PASS (`npm run typecheck` exit 0); test PASS (`npm test` exit 0); build PASS (`npm run build` exit 0); concurrency regression PASS (`npm test -- test/db-worker-client.test.ts` exit 0); release:verify FAIL (`npm run release:verify` exit 1; `GOCACHE=/tmp/lossless-claw-go-build-cache npm run release:verify` exit 1; `GOCACHE=/tmp/lossless-claw-go-build-cache GOPATH=/tmp/lossless-claw-go npm run release:verify` exit 1, blocked by Go cache permissions then no network/DNS for Go module downloads); contract completion FAIL (production hook call-site offload not completed).
