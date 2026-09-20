@@ -16,6 +16,10 @@
 
 import { AsyncLocalStorage } from "node:async_hooks";
 import type { DatabaseSync } from "node:sqlite";
+import {
+  isAsyncLcmDatabaseConnection,
+  type LcmDatabaseLike,
+} from "./db/worker/types.js";
 
 interface MutexState {
   /** Tail of the promise chain — each acquirer appends to this. */
@@ -164,37 +168,43 @@ export type BeginTransactionStatement = "BEGIN" | "BEGIN IMMEDIATE";
  * held lock and isolate their work with a savepoint instead of hanging.
  */
 export async function withDatabaseTransaction<T>(
-  db: DatabaseSync,
+  db: LcmDatabaseLike,
   beginStatement: BeginTransactionStatement,
   operation: () => Promise<T> | T,
 ): Promise<T> {
-  if (getHeldLockDepth(db) > 0) {
+  if (isAsyncLcmDatabaseConnection(db)) {
+    return db.withWorkerTransaction(beginStatement, operation);
+  }
+
+  const syncDb = db as DatabaseSync;
+
+  if (getHeldLockDepth(syncDb) > 0) {
     const savepointName = nextSavepointName();
-    db.exec(`SAVEPOINT ${savepointName}`);
+    syncDb.exec(`SAVEPOINT ${savepointName}`);
     try {
       const result = await operation();
-      db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+      syncDb.exec(`RELEASE SAVEPOINT ${savepointName}`);
       return result;
     } catch (error) {
-      db.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
-      db.exec(`RELEASE SAVEPOINT ${savepointName}`);
+      syncDb.exec(`ROLLBACK TO SAVEPOINT ${savepointName}`);
+      syncDb.exec(`RELEASE SAVEPOINT ${savepointName}`);
       throw error;
     }
   }
 
-  const release = await acquireTransactionLock(db);
+  const release = await acquireTransactionLock(syncDb);
   try {
     const heldLocks = new Map(heldLockContext.getStore() ?? []);
-    heldLocks.set(db, (heldLocks.get(db) ?? 0) + 1);
+    heldLocks.set(syncDb, (heldLocks.get(syncDb) ?? 0) + 1);
 
     return await heldLockContext.run(heldLocks, async () => {
-      db.exec(beginStatement);
+      syncDb.exec(beginStatement);
       try {
         const result = await operation();
-        db.exec("COMMIT");
+        syncDb.exec("COMMIT");
         return result;
       } catch (error) {
-        db.exec("ROLLBACK");
+        syncDb.exec("ROLLBACK");
         throw error;
       }
     });

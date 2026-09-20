@@ -3,7 +3,7 @@ import type { SQLInputValue } from "node:sqlite";
 export type MaybePromise<T> = T | Promise<T>;
 
 export interface LcmStatementResult {
-  changes: number;
+  changes: number | bigint;
   lastInsertRowid: number | bigint;
 }
 
