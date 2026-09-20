@@ -1,6 +1,8 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createAsyncLcmDatabaseConnection as createWorkerLcmDatabaseConnection } from "./worker/db-client.js";
+import type { AsyncLcmDatabaseConnection } from "./worker/types.js";
 
 type ConnectionKey = string;
 /**
@@ -12,6 +14,8 @@ const SQLITE_BUSY_TIMEOUT_MS = 30_000;
 
 const connectionsByPath = new Map<ConnectionKey, Set<DatabaseSync>>();
 const connectionIndex = new Map<DatabaseSync, ConnectionKey>();
+const asyncConnectionsByPath = new Map<ConnectionKey, Set<AsyncLcmDatabaseConnection>>();
+const asyncConnectionIndex = new Map<AsyncLcmDatabaseConnection, ConnectionKey>();
 
 function normalizeDbPathInput(dbPath: string): string {
   return typeof dbPath === "string" ? dbPath.trim() : "";
@@ -101,6 +105,32 @@ function untrackConnection(db: DatabaseSync): void {
   connectionIndex.delete(db);
 }
 
+function trackAsyncConnection(dbPath: string, db: AsyncLcmDatabaseConnection): void {
+  const key = normalizePath(dbPath);
+  let entries = asyncConnectionsByPath.get(key);
+  if (!entries) {
+    entries = new Set();
+    asyncConnectionsByPath.set(key, entries);
+  }
+  entries.add(db);
+  asyncConnectionIndex.set(db, key);
+}
+
+function untrackAsyncConnection(db: AsyncLcmDatabaseConnection): void {
+  const key = asyncConnectionIndex.get(db);
+  if (!key) {
+    return;
+  }
+  const entries = asyncConnectionsByPath.get(key);
+  if (entries) {
+    entries.delete(db);
+    if (entries.size === 0) {
+      asyncConnectionsByPath.delete(key);
+    }
+  }
+  asyncConnectionIndex.delete(db);
+}
+
 function closeDatabase(db: DatabaseSync | undefined): void {
   if (!db) {
     return;
@@ -114,6 +144,19 @@ function closeDatabase(db: DatabaseSync | undefined): void {
     // Ignore close failures; callers are shutting down anyway.
   } finally {
     untrackConnection(db);
+  }
+}
+
+async function closeAsyncDatabase(db: AsyncLcmDatabaseConnection | undefined): Promise<void> {
+  if (!db) {
+    return;
+  }
+  try {
+    await db.close();
+  } catch {
+    // Ignore close failures; callers are shutting down anyway.
+  } finally {
+    untrackAsyncConnection(db);
   }
 }
 
@@ -132,6 +175,23 @@ export function createLcmDatabaseConnection(dbPath: string): DatabaseSync {
     throw err;
   }
   trackConnection(dbPath, db);
+  return db;
+}
+
+/**
+ * Create a worker-backed SQLite connection for the given LCM database path.
+ *
+ * The returned handle mirrors the small DatabaseSync surface used by LCM
+ * (`exec`, `prepare().get/all/run`) but every operation resolves asynchronously
+ * after the worker thread performs the synchronous SQLite work.
+ */
+export function createAsyncLcmDatabaseConnection(
+  dbPath: string,
+  options?: { rpcTimeoutMs?: number },
+): AsyncLcmDatabaseConnection {
+  ensureDbDirectory(dbPath);
+  const db = createWorkerLcmDatabaseConnection(dbPath, options);
+  trackAsyncConnection(dbPath, db);
   return db;
 }
 
@@ -169,4 +229,39 @@ export function closeLcmConnection(target?: string | DatabaseSync): void {
   connectionIndex.clear();
 }
 
+/**
+ * Close tracked async worker-backed LCM connections.
+ *
+ * Mirrors closeLcmConnection() for worker handles. Kept async so worker
+ * termination and the best-effort PRAGMA optimize round-trip can complete.
+ */
+export async function closeAsyncLcmConnection(
+  target?: string | AsyncLcmDatabaseConnection,
+): Promise<void> {
+  if (target && typeof target !== "string") {
+    await closeAsyncDatabase(target);
+    return;
+  }
+
+  if (typeof target === "string") {
+    const key = normalizePath(target);
+    const entries = asyncConnectionsByPath.get(key);
+    if (!entries) {
+      return;
+    }
+    for (const db of [...entries]) {
+      await closeAsyncDatabase(db);
+    }
+    asyncConnectionsByPath.delete(key);
+    return;
+  }
+
+  for (const db of [...asyncConnectionIndex.keys()]) {
+    await closeAsyncDatabase(db);
+  }
+  asyncConnectionsByPath.clear();
+  asyncConnectionIndex.clear();
+}
+
 export const getLcmConnection = createLcmDatabaseConnection;
+export const getAsyncLcmConnection = createAsyncLcmDatabaseConnection;
